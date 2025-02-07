@@ -1,11 +1,17 @@
 package datasources
 
 import (
-	"database/sql"
-	"fmt"
+	"context"
 	"log"
 
-	"github.com/chanzuckerberg/terraform-provider-snowflake/pkg/snowflake"
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/provider/datasources"
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/provider/previewfeatures"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
+
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/internal/provider"
+
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/helpers"
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/sdk"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 )
 
@@ -50,41 +56,37 @@ var materializedViewsSchema = map[string]*schema.Schema{
 
 func MaterializedViews() *schema.Resource {
 	return &schema.Resource{
-		Read:   ReadMaterializedViews,
-		Schema: materializedViewsSchema,
+		ReadContext: PreviewFeatureReadWrapper(string(previewfeatures.MaterializedViewsDatasource), TrackingReadWrapper(datasources.MaterializedViews, ReadMaterializedViews)),
+		Schema:      materializedViewsSchema,
 	}
 }
 
-func ReadMaterializedViews(d *schema.ResourceData, meta interface{}) error {
-	db := meta.(*sql.DB)
+func ReadMaterializedViews(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	client := meta.(*provider.Context).Client
 	databaseName := d.Get("database").(string)
 	schemaName := d.Get("schema").(string)
 
-	currentViews, err := snowflake.ListMaterializedViews(databaseName, schemaName, db)
-	if err == sql.ErrNoRows {
-		// If not found, mark resource to be removed from statefile during apply or refresh
-		log.Printf("[DEBUG] materialized views in schema (%s) not found", d.Id())
-		d.SetId("")
-		return nil
-	} else if err != nil {
-		log.Printf("[DEBUG] materialized unable to parse views in schema (%s)", d.Id())
+	schemaId := sdk.NewDatabaseObjectIdentifier(databaseName, schemaName)
+	extractedMaterializedViews, err := client.MaterializedViews.Show(ctx, sdk.NewShowMaterializedViewRequest().WithIn(
+		sdk.In{Schema: schemaId},
+	))
+	if err != nil {
+		log.Printf("[DEBUG] failed when searching materialized views in schema (%s), err = %s", schemaId.FullyQualifiedName(), err.Error())
 		d.SetId("")
 		return nil
 	}
 
-	views := []map[string]interface{}{}
+	materializedViews := make([]map[string]any, len(extractedMaterializedViews))
 
-	for _, view := range currentViews {
-		viewMap := map[string]interface{}{}
-
-		viewMap["name"] = view.Name.String
-		viewMap["database"] = view.DatabaseName.String
-		viewMap["schema"] = view.SchemaName.String
-		viewMap["comment"] = view.Comment.String
-
-		views = append(views, viewMap)
+	for i, materializedView := range extractedMaterializedViews {
+		materializedViews[i] = map[string]any{
+			"name":     materializedView.Name,
+			"database": materializedView.DatabaseName,
+			"schema":   materializedView.SchemaName,
+			"comment":  materializedView.Comment,
+		}
 	}
 
-	d.SetId(fmt.Sprintf(`%v|%v`, databaseName, schemaName))
-	return d.Set("materialized_views", views)
+	d.SetId(helpers.EncodeSnowflakeID(databaseName, schemaName))
+	return diag.FromErr(d.Set("materialized_views", materializedViews))
 }

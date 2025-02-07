@@ -1,13 +1,20 @@
 package datasources
 
 import (
+	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log"
 
-	"github.com/chanzuckerberg/terraform-provider-snowflake/pkg/snowflake"
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/provider/datasources"
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/provider/previewfeatures"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
+
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/internal/provider"
+
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/snowflake"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
-	"github.com/pkg/errors"
 )
 
 var systemGetSnowflakePlatformInfoSchema = map[string]*schema.Schema{
@@ -27,47 +34,49 @@ var systemGetSnowflakePlatformInfoSchema = map[string]*schema.Schema{
 
 func SystemGetSnowflakePlatformInfo() *schema.Resource {
 	return &schema.Resource{
-		Read:   ReadSystemGetSnowflakePlatformInfo,
-		Schema: systemGetSnowflakePlatformInfoSchema,
+		ReadContext: PreviewFeatureReadWrapper(string(previewfeatures.SystemGetSnowflakePlatformInfoDatasource), TrackingReadWrapper(datasources.SystemGetSnowflakePlatformInfo, ReadSystemGetSnowflakePlatformInfo)),
+		Schema:      systemGetSnowflakePlatformInfoSchema,
 	}
 }
 
-// ReadSystemGetSnowflakePlatformInfo implements schema.ReadFunc
-func ReadSystemGetSnowflakePlatformInfo(d *schema.ResourceData, meta interface{}) error {
-	db := meta.(*sql.DB)
+// ReadSystemGetSnowflakePlatformInfo implements schema.ReadFunc.
+func ReadSystemGetSnowflakePlatformInfo(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	client := meta.(*provider.Context).Client
+	db := client.GetConn().DB
+
 	sel := snowflake.SystemGetSnowflakePlatformInfoQuery()
 	row := snowflake.QueryRow(db, sel)
 
-	acc, err := snowflake.ReadCurrentAccount(db)
+	acc, err := client.ContextFunctions.CurrentSessionDetails(context.Background())
 	if err != nil {
-		// If not found, mark resource to be removed from statefile during apply or refresh
+		// If not found, mark resource to be removed from state file during apply or refresh
 		d.SetId("")
-		log.Printf("[DEBUG] current_account failed to decode")
-		return errors.Wrap(err, "error current_account")
+		log.Println("[DEBUG] current_account failed to decode")
+		return diag.FromErr(fmt.Errorf("error current_account err = %w", err))
 	}
 
 	d.SetId(fmt.Sprintf("%s.%s", acc.Account, acc.Region))
 
 	rawInfo, err := snowflake.ScanSnowflakePlatformInfo(row)
-	if err == sql.ErrNoRows {
-		// If not found, mark resource to be removed from statefile during apply or refresh
-		log.Print("[DEBUG] system_get_snowflake_platform_info not found")
-		return errors.Wrap(err, "error system_get_snowflake_platform_info")
+	if errors.Is(err, sql.ErrNoRows) {
+		// If not found, mark resource to be removed from state file during apply or refresh
+		log.Println("[DEBUG] system_get_snowflake_platform_info not found")
+		return diag.FromErr(fmt.Errorf("error system_get_snowflake_platform_info err = %w", err))
 	}
 
 	info, err := rawInfo.GetStructuredConfig()
 	if err != nil {
-		log.Printf("[DEBUG] system_get_snowflake_platform_info failed to decode")
+		log.Println("[DEBUG] system_get_snowflake_platform_info failed to decode")
 		d.SetId("")
-		return errors.Wrap(err, "error system_get_snowflake_platform_info")
+		return diag.FromErr(fmt.Errorf("error system_get_snowflake_platform_info err = %w", err))
 	}
 
-	if err = d.Set("azure_vnet_subnet_ids", info.AzureVnetSubnetIds); err != nil {
-		return errors.Wrap(err, "error system_get_snowflake_platform_info")
+	if err := d.Set("azure_vnet_subnet_ids", info.AzureVnetSubnetIds); err != nil {
+		return diag.FromErr(fmt.Errorf("error system_get_snowflake_platform_info err = %w", err))
 	}
 
-	if err = d.Set("aws_vpc_ids", info.AwsVpcIds); err != nil {
-		return errors.Wrap(err, "error system_get_snowflake_platform_info")
+	if err := d.Set("aws_vpc_ids", info.AwsVpcIds); err != nil {
+		return diag.FromErr(fmt.Errorf("error system_get_snowflake_platform_info err = %w", err))
 	}
 
 	return nil

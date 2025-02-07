@@ -2,16 +2,26 @@ package resources
 
 import (
 	"bytes"
-	"database/sql"
+	"context"
 	"encoding/csv"
 	"fmt"
 	"strings"
 
+	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
+
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/provider/previewfeatures"
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/provider/resources"
+
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/helpers"
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/schemas"
+
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/internal/provider"
+
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/customdiff"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/validation"
-	"github.com/pkg/errors"
 
-	"github.com/chanzuckerberg/terraform-provider-snowflake/pkg/snowflake"
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/sdk"
 )
 
 const (
@@ -26,6 +36,7 @@ var formatTypeOptions = map[string][]string{
 		"record_delimiter",
 		"field_delimiter",
 		"file_extension",
+		"parse_header",
 		"skip_header",
 		"skip_blank_lines",
 		"date_format",
@@ -39,7 +50,6 @@ var formatTypeOptions = map[string][]string{
 		"null_if",
 		"error_on_column_count_mismatch",
 		"replace_invalid_characters",
-		"validate_utf8",
 		"empty_field_as_null",
 		"skip_byte_order_mark",
 		"encoding",
@@ -92,7 +102,6 @@ var fileFormatSchema = map[string]*schema.Schema{
 		Type:        schema.TypeString,
 		Required:    true,
 		Description: "Specifies the identifier for the file format; must be unique for the database and schema in which the file format is created.",
-		ForceNew:    true,
 	},
 	"database": {
 		Type:        schema.TypeString,
@@ -116,22 +125,30 @@ var fileFormatSchema = map[string]*schema.Schema{
 	"compression": {
 		Type:        schema.TypeString,
 		Optional:    true,
+		Computed:    true,
 		Description: "Specifies the current compression algorithm for the data file.",
 	},
 	"record_delimiter": {
 		Type:        schema.TypeString,
 		Optional:    true,
+		Computed:    true,
 		Description: "Specifies one or more singlebyte or multibyte characters that separate records in an input file (data loading) or unloaded file (data unloading).",
 	},
 	"field_delimiter": {
 		Type:        schema.TypeString,
 		Optional:    true,
+		Computed:    true,
 		Description: "Specifies one or more singlebyte or multibyte characters that separate fields in an input file (data loading) or unloaded file (data unloading).",
 	},
 	"file_extension": {
 		Type:        schema.TypeString,
 		Optional:    true,
 		Description: "Specifies the extension for files unloaded to a stage.",
+	},
+	"parse_header": {
+		Type:        schema.TypeBool,
+		Optional:    true,
+		Description: "Boolean that specifies whether to use the first row headers in the data files to determine column names.",
 	},
 	"skip_header": {
 		Type:        schema.TypeInt,
@@ -146,31 +163,37 @@ var fileFormatSchema = map[string]*schema.Schema{
 	"date_format": {
 		Type:        schema.TypeString,
 		Optional:    true,
+		Computed:    true,
 		Description: "Defines the format of date values in the data files (data loading) or table (data unloading).",
 	},
 	"time_format": {
 		Type:        schema.TypeString,
 		Optional:    true,
+		Computed:    true,
 		Description: "Defines the format of time values in the data files (data loading) or table (data unloading).",
 	},
 	"timestamp_format": {
 		Type:        schema.TypeString,
 		Optional:    true,
+		Computed:    true,
 		Description: "Defines the format of timestamp values in the data files (data loading) or table (data unloading).",
 	},
 	"binary_format": {
 		Type:        schema.TypeString,
 		Optional:    true,
+		Computed:    true,
 		Description: "Defines the encoding format for binary input or output.",
 	},
 	"escape": {
 		Type:        schema.TypeString,
 		Optional:    true,
+		Computed:    true,
 		Description: "Single character string used as the escape character for field values.",
 	},
 	"escape_unenclosed_field": {
 		Type:        schema.TypeString,
 		Optional:    true,
+		Computed:    true,
 		Description: "Single character string used as the escape character for unenclosed field values only.",
 	},
 	"trim_space": {
@@ -181,12 +204,14 @@ var fileFormatSchema = map[string]*schema.Schema{
 	"field_optionally_enclosed_by": {
 		Type:        schema.TypeString,
 		Optional:    true,
+		Computed:    true,
 		Description: "Character used to enclose strings.",
 	},
 	"null_if": {
 		Type:        schema.TypeList,
 		Elem:        &schema.Schema{Type: schema.TypeString},
 		Optional:    true,
+		Computed:    true,
 		Description: "String used to convert to and from SQL NULL.",
 	},
 	"error_on_column_count_mismatch": {
@@ -198,11 +223,6 @@ var fileFormatSchema = map[string]*schema.Schema{
 		Type:        schema.TypeBool,
 		Optional:    true,
 		Description: "Boolean that specifies whether to replace invalid UTF-8 characters with the Unicode replacement character (�).",
-	},
-	"validate_utf8": {
-		Type:        schema.TypeBool,
-		Optional:    true,
-		Description: "Boolean that specifies whether to validate UTF-8 character encoding in string column data.",
 	},
 	"empty_field_as_null": {
 		Type:        schema.TypeBool,
@@ -217,6 +237,7 @@ var fileFormatSchema = map[string]*schema.Schema{
 	"encoding": {
 		Type:        schema.TypeString,
 		Optional:    true,
+		Computed:    true,
 		Description: "String (constant) that specifies the character set of the source data when loading data into a table.",
 	},
 	"enable_octal": {
@@ -274,6 +295,7 @@ var fileFormatSchema = map[string]*schema.Schema{
 		Optional:    true,
 		Description: "Specifies a comment for the file format.",
 	},
+	FullyQualifiedNameAttributeName: schemas.FullyQualifiedNameSchema,
 }
 
 type fileFormatID struct {
@@ -286,239 +308,221 @@ func (ffi *fileFormatID) String() (string, error) {
 	var buf bytes.Buffer
 	csvWriter := csv.NewWriter(&buf)
 	csvWriter.Comma = fileFormatIDDelimiter
-	err := csvWriter.WriteAll([][]string{{ffi.DatabaseName, ffi.SchemaName, ffi.FileFormatName}})
-	if err != nil {
+	if err := csvWriter.WriteAll([][]string{{ffi.DatabaseName, ffi.SchemaName, ffi.FileFormatName}}); err != nil {
 		return "", err
 	}
 
 	return strings.TrimSpace(buf.String()), nil
 }
 
-// FileFormat returns a pointer to the resource representing a file format
+// FileFormat returns a pointer to the resource representing a file format.
 func FileFormat() *schema.Resource {
 	return &schema.Resource{
-		Create: CreateFileFormat,
-		Read:   ReadFileFormat,
-		Update: UpdateFileFormat,
-		Delete: DeleteFileFormat,
-		Exists: FileFormatExists,
+		CreateContext: PreviewFeatureCreateContextWrapper(string(previewfeatures.FileFormatResource), TrackingCreateWrapper(resources.FileFormat, CreateFileFormat)),
+		ReadContext:   PreviewFeatureReadContextWrapper(string(previewfeatures.FileFormatResource), TrackingReadWrapper(resources.FileFormat, ReadFileFormat)),
+		UpdateContext: PreviewFeatureUpdateContextWrapper(string(previewfeatures.FileFormatResource), TrackingUpdateWrapper(resources.FileFormat, UpdateFileFormat)),
+		DeleteContext: PreviewFeatureDeleteContextWrapper(string(previewfeatures.FileFormatResource), TrackingDeleteWrapper(resources.FileFormat, DeleteFileFormat)),
+
+		CustomizeDiff: TrackingCustomDiffWrapper(resources.FileFormat, customdiff.All(
+			ComputedIfAnyAttributeChanged(fileFormatSchema, FullyQualifiedNameAttributeName, "name"),
+		)),
 
 		Schema: fileFormatSchema,
 		Importer: &schema.ResourceImporter{
-			State: schema.ImportStatePassthrough,
+			StateContext: schema.ImportStatePassthroughContext,
 		},
 	}
 }
 
-// CreateFileFormat implements schema.CreateFunc
-func CreateFileFormat(data *schema.ResourceData, meta interface{}) error {
-	db := meta.(*sql.DB)
+// CreateFileFormat implements schema.CreateFunc.
+func CreateFileFormat(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	client := meta.(*provider.Context).Client
 
-	dbName := data.Get("database").(string)
-	schemaName := data.Get("schema").(string)
-	fileFormatName := data.Get("name").(string)
+	dbName := d.Get("database").(string)
+	schemaName := d.Get("schema").(string)
+	fileFormatName := d.Get("name").(string)
+	id := sdk.NewSchemaObjectIdentifier(dbName, schemaName, fileFormatName)
 
-	builder := snowflake.FileFormat(fileFormatName, dbName, schemaName)
-
-	formatType := data.Get("format_type").(string)
-	builder.WithFormatType(formatType)
-
-	// Set optionals
-	if v, ok, err := getFormatTypeOption(data, formatType, "compression"); ok && err == nil {
-		builder.WithCompression(v.(string))
-	} else if err != nil {
-		return err
+	opts := sdk.CreateFileFormatOptions{
+		Type:                  sdk.FileFormatType(d.Get("format_type").(string)),
+		FileFormatTypeOptions: sdk.FileFormatTypeOptions{},
 	}
 
-	if v, ok, err := getFormatTypeOption(data, formatType, "record_delimiter"); ok && err == nil {
-		builder.WithRecordDelimiter(v.(string))
-	} else if err != nil {
-		return err
+	switch opts.Type {
+	case sdk.FileFormatTypeCSV:
+		if v, ok := d.GetOk("compression"); ok {
+			comp := sdk.CSVCompression(v.(string))
+			opts.CSVCompression = &comp
+		}
+		if v, ok := d.GetOk("record_delimiter"); ok {
+			opts.CSVRecordDelimiter = sdk.String(v.(string))
+		}
+		if v, ok := d.GetOk("field_delimiter"); ok {
+			opts.CSVFieldDelimiter = sdk.String(v.(string))
+		}
+		if v, ok := d.GetOk("file_extension"); ok {
+			opts.CSVFileExtension = sdk.String(v.(string))
+		}
+		opts.CSVParseHeader = sdk.Bool(d.Get("parse_header").(bool))
+		if v, ok := d.GetOk("skip_header"); ok {
+			opts.CSVSkipHeader = sdk.Int(v.(int))
+		}
+		opts.CSVSkipBlankLines = sdk.Bool(d.Get("skip_blank_lines").(bool))
+		if v, ok := d.GetOk("date_format"); ok {
+			opts.CSVDateFormat = sdk.String(v.(string))
+		}
+		if v, ok := d.GetOk("time_format"); ok {
+			opts.CSVTimeFormat = sdk.String(v.(string))
+		}
+		if v, ok := d.GetOk("timestamp_format"); ok {
+			opts.CSVTimestampFormat = sdk.String(v.(string))
+		}
+		if v, ok := d.GetOk("binary_format"); ok {
+			bf := sdk.BinaryFormat(v.(string))
+			opts.CSVBinaryFormat = &bf
+		}
+		if v, ok := d.GetOk("escape"); ok {
+			opts.CSVEscape = sdk.String(v.(string))
+		}
+		if v, ok := d.GetOk("escape_unenclosed_field"); ok {
+			opts.CSVEscapeUnenclosedField = sdk.String(v.(string))
+		}
+		opts.CSVTrimSpace = sdk.Bool(d.Get("trim_space").(bool))
+		if v, ok := d.GetOk("field_optionally_enclosed_by"); ok {
+			opts.CSVFieldOptionallyEnclosedBy = sdk.String(v.(string))
+		}
+		if v, ok := d.GetOk("null_if"); ok {
+			nullIf := []sdk.NullString{}
+			for _, s := range v.([]interface{}) {
+				if s == nil {
+					s = ""
+				} else {
+					s = s.(string)
+				}
+				nullIf = append(nullIf, sdk.NullString{S: s.(string)})
+			}
+			opts.CSVNullIf = &nullIf
+		}
+		opts.CSVErrorOnColumnCountMismatch = sdk.Bool(d.Get("error_on_column_count_mismatch").(bool))
+		opts.CSVReplaceInvalidCharacters = sdk.Bool(d.Get("replace_invalid_characters").(bool))
+		opts.CSVEmptyFieldAsNull = sdk.Bool(d.Get("empty_field_as_null").(bool))
+		opts.CSVSkipByteOrderMark = sdk.Bool(d.Get("skip_byte_order_mark").(bool))
+		if v, ok := d.GetOk("encoding"); ok {
+			enc := sdk.CSVEncoding(v.(string))
+			opts.CSVEncoding = &enc
+		}
+	case sdk.FileFormatTypeJSON:
+		if v, ok := d.GetOk("compression"); ok {
+			comp := sdk.JSONCompression(v.(string))
+			opts.JSONCompression = &comp
+		}
+		if v, ok := d.GetOk("date_format"); ok {
+			opts.JSONDateFormat = sdk.String(v.(string))
+		}
+		if v, ok := d.GetOk("time_format"); ok {
+			opts.JSONTimeFormat = sdk.String(v.(string))
+		}
+		if v, ok := d.GetOk("timestamp_format"); ok {
+			opts.JSONTimestampFormat = sdk.String(v.(string))
+		}
+		if v, ok := d.GetOk("binary_format"); ok {
+			bf := sdk.BinaryFormat(v.(string))
+			opts.JSONBinaryFormat = &bf
+		}
+		opts.JSONTrimSpace = sdk.Bool(d.Get("trim_space").(bool))
+		if v, ok := d.GetOk("null_if"); ok {
+			nullIf := []sdk.NullString{}
+			for _, s := range v.([]interface{}) {
+				if s == nil {
+					s = ""
+				} else {
+					s = s.(string)
+				}
+				nullIf = append(nullIf, sdk.NullString{S: s.(string)})
+			}
+			opts.JSONNullIf = nullIf
+		}
+		if v, ok := d.GetOk("file_extension"); ok {
+			opts.JSONFileExtension = sdk.String(v.(string))
+		}
+		opts.JSONEnableOctal = sdk.Bool(d.Get("enable_octal").(bool))
+		opts.JSONAllowDuplicate = sdk.Bool(d.Get("allow_duplicate").(bool))
+		opts.JSONStripOuterArray = sdk.Bool(d.Get("strip_outer_array").(bool))
+		opts.JSONStripNullValues = sdk.Bool(d.Get("strip_null_values").(bool))
+		opts.JSONReplaceInvalidCharacters = sdk.Bool(d.Get("replace_invalid_characters").(bool))
+		opts.JSONIgnoreUTF8Errors = sdk.Bool(d.Get("ignore_utf8_errors").(bool))
+		opts.JSONSkipByteOrderMark = sdk.Bool(d.Get("skip_byte_order_mark").(bool))
+	case sdk.FileFormatTypeAvro:
+		if v, ok := d.GetOk("compression"); ok {
+			comp := sdk.AvroCompression(v.(string))
+			opts.AvroCompression = &comp
+		}
+		opts.AvroTrimSpace = sdk.Bool(d.Get("trim_space").(bool))
+		if v, ok := d.GetOk("null_if"); ok {
+			nullIf := []sdk.NullString{}
+			for _, s := range v.([]interface{}) {
+				if s == nil {
+					s = ""
+				} else {
+					s = s.(string)
+				}
+				nullIf = append(nullIf, sdk.NullString{S: s.(string)})
+			}
+			opts.AvroNullIf = &nullIf
+		}
+	case sdk.FileFormatTypeORC:
+		opts.ORCTrimSpace = sdk.Bool(d.Get("trim_space").(bool))
+		if v, ok := d.GetOk("null_if"); ok {
+			nullIf := []sdk.NullString{}
+			for _, s := range v.([]interface{}) {
+				if s == nil {
+					s = ""
+				} else {
+					s = s.(string)
+				}
+				nullIf = append(nullIf, sdk.NullString{S: s.(string)})
+			}
+			opts.ORCNullIf = &nullIf
+		}
+	case sdk.FileFormatTypeParquet:
+		if v, ok := d.GetOk("compression"); ok {
+			comp := sdk.ParquetCompression(v.(string))
+			opts.ParquetCompression = &comp
+		}
+		opts.ParquetBinaryAsText = sdk.Bool(d.Get("binary_as_text").(bool))
+		opts.ParquetTrimSpace = sdk.Bool(d.Get("trim_space").(bool))
+		if v, ok := d.GetOk("null_if"); ok {
+			nullIf := []sdk.NullString{}
+			for _, s := range v.([]interface{}) {
+				if s == nil {
+					s = ""
+				} else {
+					s = s.(string)
+				}
+				nullIf = append(nullIf, sdk.NullString{S: s.(string)})
+			}
+			opts.ParquetNullIf = &nullIf
+		}
+	case sdk.FileFormatTypeXML:
+		if v, ok := d.GetOk("compression"); ok {
+			comp := sdk.XMLCompression(v.(string))
+			opts.XMLCompression = &comp
+		}
+		opts.XMLIgnoreUTF8Errors = sdk.Bool(d.Get("ignore_utf8_errors").(bool))
+		opts.XMLPreserveSpace = sdk.Bool(d.Get("preserve_space").(bool))
+		opts.XMLStripOuterElement = sdk.Bool(d.Get("strip_outer_element").(bool))
+		opts.XMLDisableSnowflakeData = sdk.Bool(d.Get("disable_snowflake_data").(bool))
+		opts.XMLDisableAutoConvert = sdk.Bool(d.Get("disable_auto_convert").(bool))
+		opts.XMLSkipByteOrderMark = sdk.Bool(d.Get("skip_byte_order_mark").(bool))
 	}
 
-	if v, ok, err := getFormatTypeOption(data, formatType, "field_delimiter"); ok && err == nil {
-		builder.WithFieldDelimiter(v.(string))
-	} else if err != nil {
-		return err
+	if v, ok := d.GetOk("comment"); ok {
+		opts.Comment = sdk.String(v.(string))
 	}
 
-	if v, ok, err := getFormatTypeOption(data, formatType, "file_extension"); ok && err == nil {
-		builder.WithFileExtension(v.(string))
-	} else if err != nil {
-		return err
-	}
-
-	if v, ok, err := getFormatTypeOption(data, formatType, "skip_header"); ok && err == nil {
-		builder.WithSkipHeader(v.(int))
-	} else if err != nil {
-		return err
-	}
-
-	if v, ok, err := getFormatTypeOption(data, formatType, "skip_blank_lines"); ok && err == nil {
-		builder.WithSkipBlankLines(v.(bool))
-	} else if err != nil {
-		return err
-	}
-
-	if v, ok, err := getFormatTypeOption(data, formatType, "date_format"); ok && err == nil {
-		builder.WithDateFormat(v.(string))
-	} else if err != nil {
-		return err
-	}
-
-	if v, ok, err := getFormatTypeOption(data, formatType, "time_format"); ok && err == nil {
-		builder.WithTimeFormat(v.(string))
-	} else if err != nil {
-		return err
-	}
-
-	if v, ok, err := getFormatTypeOption(data, formatType, "timestamp_format"); ok && err == nil {
-		builder.WithTimestampFormat(v.(string))
-	} else if err != nil {
-		return err
-	}
-
-	if v, ok, err := getFormatTypeOption(data, formatType, "binary_format"); ok && err == nil {
-		builder.WithBinaryFormat(v.(string))
-	} else if err != nil {
-		return err
-	}
-
-	if v, ok, err := getFormatTypeOption(data, formatType, "escape"); ok && err == nil {
-		builder.WithEscape(v.(string))
-	} else if err != nil {
-		return err
-	}
-
-	if v, ok, err := getFormatTypeOption(data, formatType, "escape_unenclosed_field"); ok && err == nil {
-		builder.WithEscapeUnenclosedField(v.(string))
-	} else if err != nil {
-		return err
-	}
-
-	if v, ok, err := getFormatTypeOption(data, formatType, "trim_space"); ok && err == nil {
-		builder.WithTrimSpace(v.(bool))
-	} else if err != nil {
-		return err
-	}
-
-	if v, ok, err := getFormatTypeOption(data, formatType, "field_optionally_enclosed_by"); ok && err == nil {
-		builder.WithFieldOptionallyEnclosedBy(v.(string))
-	} else if err != nil {
-		return err
-	}
-
-	if v, ok, err := getFormatTypeOption(data, formatType, "null_if"); ok && err == nil {
-		builder.WithNullIf(expandStringList(v.([]interface{})))
-	} else if err != nil {
-		return err
-	}
-
-	if v, ok, err := getFormatTypeOption(data, formatType, "error_on_column_count_mismatch"); ok && err == nil {
-		builder.WithErrorOnColumnCountMismatch(v.(bool))
-	} else if err != nil {
-		return err
-	}
-
-	if v, ok, err := getFormatTypeOption(data, formatType, "replace_invalid_characters"); ok && err == nil {
-		builder.WithReplaceInvalidCharacters(v.(bool))
-	} else if err != nil {
-		return err
-	}
-
-	if v, ok, err := getFormatTypeOption(data, formatType, "validate_utf8"); ok && err == nil {
-		builder.WithValidateUTF8(v.(bool))
-	} else if err != nil {
-		return err
-	}
-
-	if v, ok, err := getFormatTypeOption(data, formatType, "empty_field_as_null"); ok && err == nil {
-		builder.WithEmptyFieldAsNull(v.(bool))
-	} else if err != nil {
-		return err
-	}
-
-	if v, ok, err := getFormatTypeOption(data, formatType, "skip_byte_order_mark"); ok && err == nil {
-		builder.WithSkipByteOrderMark(v.(bool))
-	} else if err != nil {
-		return err
-	}
-
-	if v, ok, err := getFormatTypeOption(data, formatType, "encoding"); ok && err == nil {
-		builder.WithEncoding(v.(string))
-	} else if err != nil {
-		return err
-	}
-
-	if v, ok, err := getFormatTypeOption(data, formatType, "enable_octal"); ok && err == nil {
-		builder.WithEnableOctal(v.(bool))
-	} else if err != nil {
-		return err
-	}
-
-	if v, ok, err := getFormatTypeOption(data, formatType, "allow_duplicate"); ok && err == nil {
-		builder.WithAllowDuplicate(v.(bool))
-	} else if err != nil {
-		return err
-	}
-
-	if v, ok, err := getFormatTypeOption(data, formatType, "strip_outer_array"); ok && err == nil {
-		builder.WithStripOuterArray(v.(bool))
-	} else if err != nil {
-		return err
-	}
-
-	if v, ok, err := getFormatTypeOption(data, formatType, "strip_null_values"); ok && err == nil {
-		builder.WithStripNullValues(v.(bool))
-	} else if err != nil {
-		return err
-	}
-
-	if v, ok, err := getFormatTypeOption(data, formatType, "ignore_utf8_errors"); ok && err == nil {
-		builder.WithIgnoreUTF8Errors(v.(bool))
-	} else if err != nil {
-		return err
-	}
-
-	if v, ok, err := getFormatTypeOption(data, formatType, "binary_as_text"); ok && err == nil {
-		builder.WithBinaryAsText(v.(bool))
-	} else if err != nil {
-		return err
-	}
-
-	if v, ok, err := getFormatTypeOption(data, formatType, "preserve_space"); ok && err == nil {
-		builder.WithPreserveSpace(v.(bool))
-	} else if err != nil {
-		return err
-	}
-
-	if v, ok, err := getFormatTypeOption(data, formatType, "strip_outer_element"); ok && err == nil {
-		builder.WithStripOuterElement(v.(bool))
-	} else if err != nil {
-		return err
-	}
-
-	if v, ok, err := getFormatTypeOption(data, formatType, "disable_snowflake_data"); ok && err == nil {
-		builder.WithDisableSnowflakeData(v.(bool))
-	} else if err != nil {
-		return err
-	}
-
-	if v, ok, err := getFormatTypeOption(data, formatType, "disable_auto_convert"); ok && err == nil {
-		builder.WithDisableAutoConvert(v.(bool))
-	} else if err != nil {
-		return err
-	}
-
-	if v, ok := data.GetOk("comment"); ok {
-		builder.WithComment(v.(string))
-	}
-
-	q := builder.Create()
-
-	err := snowflake.Exec(db, q)
+	err := client.FileFormats.Create(ctx, id, &opts)
 	if err != nil {
-		return errors.Wrapf(err, "error creating file format %v", fileFormatName)
+		return diag.FromErr(err)
 	}
 
 	fileFormatID := &fileFormatID{
@@ -528,576 +532,615 @@ func CreateFileFormat(data *schema.ResourceData, meta interface{}) error {
 	}
 	dataIDInput, err := fileFormatID.String()
 	if err != nil {
-		return err
+		return diag.FromErr(err)
 	}
-	data.SetId(dataIDInput)
+	d.SetId(dataIDInput)
 
-	return ReadFileFormat(data, meta)
+	return ReadFileFormat(ctx, d, meta)
 }
 
-// ReadFileFormat implements schema.ReadFunc
-func ReadFileFormat(data *schema.ResourceData, meta interface{}) error {
-	db := meta.(*sql.DB)
-	fileFormatID, err := fileFormatIDFromString(data.Id())
+// ReadFileFormat implements schema.ReadFunc.
+func ReadFileFormat(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	client := meta.(*provider.Context).Client
+
+	fileFormatID, err := fileFormatIDFromString(d.Id())
 	if err != nil {
-		return err
+		return diag.FromErr(err)
+	}
+	id := sdk.NewSchemaObjectIdentifier(fileFormatID.DatabaseName, fileFormatID.SchemaName, fileFormatID.FileFormatName)
+
+	fileFormat, err := client.FileFormats.ShowByID(ctx, id)
+	if err != nil {
+		return diag.FromErr(fmt.Errorf("cannot read file format: %w", err))
 	}
 
-	dbName := fileFormatID.DatabaseName
-	schemaName := fileFormatID.SchemaName
-	fileFormatName := fileFormatID.FileFormatName
-
-	ff := snowflake.FileFormat(fileFormatName, dbName, schemaName).Show()
-	row := snowflake.QueryRow(db, ff)
-
-	f, err := snowflake.ScanFileFormatShow(row)
-	if err != nil {
-		return err
+	if err := d.Set(FullyQualifiedNameAttributeName, id.FullyQualifiedName()); err != nil {
+		return diag.FromErr(err)
 	}
 
-	opts, err := snowflake.ParseFormatOptions(f.FormatOptions.String)
-	if err != nil {
-		return err
+	if err := d.Set("name", fileFormat.Name.Name()); err != nil {
+		return diag.FromErr(err)
 	}
 
-	err = data.Set("name", f.FileFormatName.String)
-	if err != nil {
-		return err
+	if err := d.Set("database", fileFormat.Name.DatabaseName()); err != nil {
+		return diag.FromErr(err)
 	}
 
-	err = data.Set("database", f.DatabaseName.String)
-	if err != nil {
-		return err
+	if err := d.Set("schema", fileFormat.Name.SchemaName()); err != nil {
+		return diag.FromErr(err)
 	}
 
-	err = data.Set("schema", f.SchemaName.String)
-	if err != nil {
-		return err
+	if err := d.Set("format_type", fileFormat.Type); err != nil {
+		return diag.FromErr(err)
 	}
 
-	err = data.Set("format_type", opts.Type)
-	if err != nil {
-		return err
+	switch fileFormat.Type {
+	case sdk.FileFormatTypeCSV:
+		if err := d.Set("compression", fileFormat.Options.CSVCompression); err != nil {
+			return diag.FromErr(err)
+		}
+		if err := d.Set("record_delimiter", fileFormat.Options.CSVRecordDelimiter); err != nil {
+			return diag.FromErr(err)
+		}
+		if err := d.Set("field_delimiter", fileFormat.Options.CSVFieldDelimiter); err != nil {
+			return diag.FromErr(err)
+		}
+		if err := d.Set("file_extension", fileFormat.Options.CSVFileExtension); err != nil {
+			return diag.FromErr(err)
+		}
+		if err := d.Set("parse_header", fileFormat.Options.CSVParseHeader); err != nil {
+			return diag.FromErr(err)
+		}
+		if err := d.Set("skip_header", fileFormat.Options.CSVSkipHeader); err != nil {
+			return diag.FromErr(err)
+		}
+		if err := d.Set("skip_blank_lines", fileFormat.Options.CSVSkipBlankLines); err != nil {
+			return diag.FromErr(err)
+		}
+		if err := d.Set("date_format", fileFormat.Options.CSVDateFormat); err != nil {
+			return diag.FromErr(err)
+		}
+		if err := d.Set("time_format", fileFormat.Options.CSVTimeFormat); err != nil {
+			return diag.FromErr(err)
+		}
+		if err := d.Set("timestamp_format", fileFormat.Options.CSVTimestampFormat); err != nil {
+			return diag.FromErr(err)
+		}
+		if err := d.Set("binary_format", fileFormat.Options.CSVBinaryFormat); err != nil {
+			return diag.FromErr(err)
+		}
+		if err := d.Set("escape", fileFormat.Options.CSVEscape); err != nil {
+			return diag.FromErr(err)
+		}
+		if err := d.Set("escape_unenclosed_field", fileFormat.Options.CSVEscapeUnenclosedField); err != nil {
+			return diag.FromErr(err)
+		}
+		if err := d.Set("trim_space", fileFormat.Options.CSVTrimSpace); err != nil {
+			return diag.FromErr(err)
+		}
+		if err := d.Set("field_optionally_enclosed_by", fileFormat.Options.CSVFieldOptionallyEnclosedBy); err != nil {
+			return diag.FromErr(err)
+		}
+		nullIf := []string{}
+		for _, s := range *fileFormat.Options.CSVNullIf {
+			nullIf = append(nullIf, s.S)
+		}
+		if err := d.Set("null_if", nullIf); err != nil {
+			return diag.FromErr(err)
+		}
+		if err := d.Set("error_on_column_count_mismatch", fileFormat.Options.CSVErrorOnColumnCountMismatch); err != nil {
+			return diag.FromErr(err)
+		}
+		if err := d.Set("replace_invalid_characters", fileFormat.Options.CSVReplaceInvalidCharacters); err != nil {
+			return diag.FromErr(err)
+		}
+		if err := d.Set("empty_field_as_null", fileFormat.Options.CSVEmptyFieldAsNull); err != nil {
+			return diag.FromErr(err)
+		}
+		if err := d.Set("skip_byte_order_mark", fileFormat.Options.CSVSkipByteOrderMark); err != nil {
+			return diag.FromErr(err)
+		}
+		if err := d.Set("encoding", fileFormat.Options.CSVEncoding); err != nil {
+			return diag.FromErr(err)
+		}
+	case sdk.FileFormatTypeJSON:
+		if err := d.Set("compression", fileFormat.Options.JSONCompression); err != nil {
+			return diag.FromErr(err)
+		}
+		if err := d.Set("date_format", fileFormat.Options.JSONDateFormat); err != nil {
+			return diag.FromErr(err)
+		}
+		if err := d.Set("time_format", fileFormat.Options.JSONTimeFormat); err != nil {
+			return diag.FromErr(err)
+		}
+		if err := d.Set("timestamp_format", fileFormat.Options.JSONTimestampFormat); err != nil {
+			return diag.FromErr(err)
+		}
+		if err := d.Set("binary_format", fileFormat.Options.JSONBinaryFormat); err != nil {
+			return diag.FromErr(err)
+		}
+		if err := d.Set("trim_space", fileFormat.Options.JSONTrimSpace); err != nil {
+			return diag.FromErr(err)
+		}
+		nullIf := []string{}
+		for _, s := range fileFormat.Options.JSONNullIf {
+			nullIf = append(nullIf, s.S)
+		}
+		if err := d.Set("null_if", nullIf); err != nil {
+			return diag.FromErr(err)
+		}
+		if err := d.Set("file_extension", fileFormat.Options.JSONFileExtension); err != nil {
+			return diag.FromErr(err)
+		}
+		if err := d.Set("enable_octal", fileFormat.Options.JSONEnableOctal); err != nil {
+			return diag.FromErr(err)
+		}
+		if err := d.Set("allow_duplicate", fileFormat.Options.JSONAllowDuplicate); err != nil {
+			return diag.FromErr(err)
+		}
+		if err := d.Set("strip_outer_array", fileFormat.Options.JSONStripOuterArray); err != nil {
+			return diag.FromErr(err)
+		}
+		if err := d.Set("strip_null_values", fileFormat.Options.JSONStripNullValues); err != nil {
+			return diag.FromErr(err)
+		}
+		if err := d.Set("replace_invalid_characters", fileFormat.Options.JSONReplaceInvalidCharacters); err != nil {
+			return diag.FromErr(err)
+		}
+		if err := d.Set("ignore_utf8_errors", fileFormat.Options.JSONIgnoreUTF8Errors); err != nil {
+			return diag.FromErr(err)
+		}
+		if err := d.Set("skip_byte_order_mark", fileFormat.Options.JSONSkipByteOrderMark); err != nil {
+			return diag.FromErr(err)
+		}
+	case sdk.FileFormatTypeAvro:
+		if err := d.Set("compression", fileFormat.Options.AvroCompression); err != nil {
+			return diag.FromErr(err)
+		}
+		if err := d.Set("trim_space", fileFormat.Options.AvroTrimSpace); err != nil {
+			return diag.FromErr(err)
+		}
+		nullIf := []string{}
+		for _, s := range *fileFormat.Options.AvroNullIf {
+			nullIf = append(nullIf, s.S)
+		}
+		if err := d.Set("null_if", nullIf); err != nil {
+			return diag.FromErr(err)
+		}
+	case sdk.FileFormatTypeORC:
+		if err := d.Set("trim_space", fileFormat.Options.ORCTrimSpace); err != nil {
+			return diag.FromErr(err)
+		}
+		nullIf := []string{}
+		for _, s := range *fileFormat.Options.ORCNullIf {
+			nullIf = append(nullIf, s.S)
+		}
+		if err := d.Set("null_if", nullIf); err != nil {
+			return diag.FromErr(err)
+		}
+	case sdk.FileFormatTypeParquet:
+		if err := d.Set("compression", fileFormat.Options.ParquetCompression); err != nil {
+			return diag.FromErr(err)
+		}
+		if err := d.Set("binary_as_text", fileFormat.Options.ParquetBinaryAsText); err != nil {
+			return diag.FromErr(err)
+		}
+		if err := d.Set("trim_space", fileFormat.Options.ParquetTrimSpace); err != nil {
+			return diag.FromErr(err)
+		}
+		nullIf := []string{}
+		for _, s := range *fileFormat.Options.ParquetNullIf {
+			nullIf = append(nullIf, s.S)
+		}
+		if err := d.Set("null_if", nullIf); err != nil {
+			return diag.FromErr(err)
+		}
+	case sdk.FileFormatTypeXML:
+		if err := d.Set("compression", fileFormat.Options.XMLCompression); err != nil {
+			return diag.FromErr(err)
+		}
+		if err := d.Set("ignore_utf8_errors", fileFormat.Options.XMLIgnoreUTF8Errors); err != nil {
+			return diag.FromErr(err)
+		}
+		if err := d.Set("preserve_space", fileFormat.Options.XMLPreserveSpace); err != nil {
+			return diag.FromErr(err)
+		}
+		if err := d.Set("strip_outer_element", fileFormat.Options.XMLStripOuterElement); err != nil {
+			return diag.FromErr(err)
+		}
+		if err := d.Set("disable_snowflake_data", fileFormat.Options.XMLDisableSnowflakeData); err != nil {
+			return diag.FromErr(err)
+		}
+		if err := d.Set("disable_auto_convert", fileFormat.Options.XMLDisableAutoConvert); err != nil {
+			return diag.FromErr(err)
+		}
+		if err := d.Set("skip_byte_order_mark", fileFormat.Options.XMLSkipByteOrderMark); err != nil {
+			return diag.FromErr(err)
+		}
+		// Terraform doesn't like it when computed fields aren't set.
+		if err := d.Set("null_if", []string{}); err != nil {
+			return diag.FromErr(err)
+		}
 	}
 
-	err = data.Set("compression", opts.Compression)
-	if err != nil {
-		return err
+	if err := d.Set("comment", fileFormat.Comment); err != nil {
+		return diag.FromErr(err)
 	}
-
-	err = data.Set("record_delimiter", opts.RecordDelimiter)
-	if err != nil {
-		return err
-	}
-
-	err = data.Set("field_delimiter", opts.FieldDelimiter)
-	if err != nil {
-		return err
-	}
-
-	err = data.Set("file_extension", opts.FileExtension)
-	if err != nil {
-		return err
-	}
-
-	err = data.Set("skip_header", opts.SkipHeader)
-	if err != nil {
-		return err
-	}
-
-	err = data.Set("skip_blank_lines", opts.SkipBlankLines)
-	if err != nil {
-		return err
-	}
-
-	err = data.Set("date_format", opts.DateFormat)
-	if err != nil {
-		return err
-	}
-
-	err = data.Set("time_format", opts.TimeFormat)
-	if err != nil {
-		return err
-	}
-
-	err = data.Set("timestamp_format", opts.TimestampFormat)
-	if err != nil {
-		return err
-	}
-
-	err = data.Set("binary_format", opts.BinaryFormat)
-	if err != nil {
-		return err
-	}
-
-	err = data.Set("escape", opts.Escape)
-	if err != nil {
-		return err
-	}
-
-	err = data.Set("escape_unenclosed_field", opts.EscapeUnenclosedField)
-	if err != nil {
-		return err
-	}
-
-	err = data.Set("trim_space", opts.TrimSpace)
-	if err != nil {
-		return err
-	}
-
-	err = data.Set("field_optionally_enclosed_by", opts.FieldOptionallyEnclosedBy)
-	if err != nil {
-		return err
-	}
-
-	err = data.Set("null_if", opts.NullIf)
-	if err != nil {
-		return err
-	}
-
-	err = data.Set("error_on_column_count_mismatch", opts.ErrorOnColumnCountMismatch)
-	if err != nil {
-		return err
-	}
-
-	err = data.Set("replace_invalid_characters", opts.ReplaceInvalidCharacters)
-	if err != nil {
-		return err
-	}
-
-	err = data.Set("validate_utf8", opts.ValidateUTF8)
-	if err != nil {
-		return err
-	}
-
-	err = data.Set("empty_field_as_null", opts.EmptyFieldAsNull)
-	if err != nil {
-		return err
-	}
-
-	err = data.Set("skip_byte_order_mark", opts.SkipByteOrderMark)
-	if err != nil {
-		return err
-	}
-
-	err = data.Set("encoding", opts.Encoding)
-	if err != nil {
-		return err
-	}
-
-	err = data.Set("enable_octal", opts.EnabelOctal)
-	if err != nil {
-		return err
-	}
-
-	err = data.Set("allow_duplicate", opts.AllowDuplicate)
-	if err != nil {
-		return err
-	}
-
-	err = data.Set("strip_outer_array", opts.StripOuterArray)
-	if err != nil {
-		return err
-	}
-
-	err = data.Set("strip_null_values", opts.StripNullValues)
-	if err != nil {
-		return err
-	}
-
-	err = data.Set("ignore_utf8_errors", opts.IgnoreUTF8Errors)
-	if err != nil {
-		return err
-	}
-
-	err = data.Set("binary_as_text", opts.BinaryAsText)
-	if err != nil {
-		return err
-	}
-
-	err = data.Set("preserve_space", opts.PreserveSpace)
-	if err != nil {
-		return err
-	}
-
-	err = data.Set("strip_outer_element", opts.StripOuterElement)
-	if err != nil {
-		return err
-	}
-
-	err = data.Set("disable_snowflake_data", opts.DisableSnowflakeData)
-	if err != nil {
-		return err
-	}
-
-	err = data.Set("disable_auto_convert", opts.DisableAutoConvert)
-	if err != nil {
-		return err
-	}
-
-	err = data.Set("comment", f.Comment.String)
-	if err != nil {
-		return err
-	}
-
 	return nil
 }
 
-// UpdateFileFormat implements schema.UpdateFunc
-func UpdateFileFormat(data *schema.ResourceData, meta interface{}) error {
-	fileFormatID, err := fileFormatIDFromString(data.Id())
+// UpdateFileFormat implements schema.UpdateFunc.
+func UpdateFileFormat(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	client := meta.(*provider.Context).Client
+
+	fileFormatID, err := fileFormatIDFromString(d.Id())
 	if err != nil {
-		return err
+		return diag.FromErr(err)
+	}
+	id := sdk.NewSchemaObjectIdentifier(fileFormatID.DatabaseName, fileFormatID.SchemaName, fileFormatID.FileFormatName)
+
+	if d.HasChange("name") {
+		newId := sdk.NewSchemaObjectIdentifierInSchema(id.SchemaId(), d.Get("name").(string))
+
+		err := client.FileFormats.Alter(ctx, id, &sdk.AlterFileFormatOptions{
+			Rename: &sdk.AlterFileFormatRenameOptions{
+				NewName: newId,
+			},
+		})
+		if err != nil {
+			return diag.FromErr(fmt.Errorf("error renaming file format: %w", err))
+		}
+
+		d.SetId(helpers.EncodeSnowflakeID(newId))
+		id = newId
 	}
 
-	dbName := fileFormatID.DatabaseName
-	schemaName := fileFormatID.SchemaName
-	fileFormatName := fileFormatID.FileFormatName
+	runSet := false
+	opts := sdk.AlterFileFormatOptions{Set: &sdk.FileFormatTypeOptions{}}
 
-	builder := snowflake.FileFormat(fileFormatName, dbName, schemaName)
-	fmt.Println(builder)
-
-	db := meta.(*sql.DB)
-	if data.HasChange("compression") {
-		change := data.Get("compression")
-		q := builder.ChangeCompression(change.(string))
-		err := snowflake.Exec(db, q)
-		if err != nil {
-			return errors.Wrapf(err, "error updating file format compression on %v", data.Id())
+	switch sdk.FileFormatType(d.Get("format_type").(string)) {
+	case sdk.FileFormatTypeCSV:
+		if d.HasChange("compression") {
+			v := sdk.CSVCompression(d.Get("compression").(string))
+			opts.Set.CSVCompression = &v
+			runSet = true
+		}
+		if d.HasChange("record_delimiter") {
+			v := d.Get("record_delimiter").(string)
+			opts.Set.CSVRecordDelimiter = &v
+			runSet = true
+		}
+		if d.HasChange("field_delimiter") {
+			v := d.Get("field_delimiter").(string)
+			opts.Set.CSVFieldDelimiter = &v
+			runSet = true
+		}
+		if d.HasChange("file_extension") {
+			v := d.Get("file_extension").(string)
+			opts.Set.CSVFileExtension = &v
+			runSet = true
+		}
+		if d.HasChange("parse_header") {
+			v := d.Get("parse_header").(bool)
+			opts.Set.CSVParseHeader = &v
+			runSet = true
+		}
+		if d.HasChange("skip_header") {
+			v := d.Get("skip_header").(int)
+			opts.Set.CSVSkipHeader = &v
+			runSet = true
+		}
+		if d.HasChange("skip_blank_lines") {
+			v := d.Get("skip_blank_lines").(bool)
+			opts.Set.CSVSkipBlankLines = &v
+			runSet = true
+		}
+		if d.HasChange("date_format") {
+			v := d.Get("date_format").(string)
+			opts.Set.CSVDateFormat = &v
+			runSet = true
+		}
+		if d.HasChange("time_format") {
+			v := d.Get("time_format").(string)
+			opts.Set.CSVTimeFormat = &v
+			runSet = true
+		}
+		if d.HasChange("timestamp_format") {
+			v := d.Get("timestamp_format").(string)
+			opts.Set.CSVTimestampFormat = &v
+			runSet = true
+		}
+		if d.HasChange("binary_format") {
+			v := sdk.BinaryFormat(d.Get("binary_format").(string))
+			opts.Set.CSVBinaryFormat = &v
+			runSet = true
+		}
+		if d.HasChange("escape") {
+			v := d.Get("escape").(string)
+			opts.Set.CSVEscape = &v
+			runSet = true
+		}
+		if d.HasChange("escape_unenclosed_field") {
+			v := d.Get("escape_unenclosed_field").(string)
+			opts.Set.CSVEscapeUnenclosedField = &v
+			runSet = true
+		}
+		if d.HasChange("trim_space") {
+			v := d.Get("trim_space").(bool)
+			opts.Set.CSVTrimSpace = &v
+			runSet = true
+		}
+		if d.HasChange("field_optionally_enclosed_by") {
+			v := d.Get("field_optionally_enclosed_by").(string)
+			opts.Set.CSVFieldOptionallyEnclosedBy = &v
+			runSet = true
+		}
+		if d.HasChange("null_if") {
+			nullIf := []sdk.NullString{}
+			for _, s := range d.Get("null_if").([]interface{}) {
+				if s == nil {
+					s = ""
+				} else {
+					s = s.(string)
+				}
+				nullIf = append(nullIf, sdk.NullString{S: s.(string)})
+			}
+			opts.Set.CSVNullIf = &nullIf
+			runSet = true
+		}
+		if d.HasChange("error_on_column_count_mismatch") {
+			v := d.Get("error_on_column_count_mismatch").(bool)
+			opts.Set.CSVErrorOnColumnCountMismatch = &v
+			runSet = true
+		}
+		if d.HasChange("replace_invalid_characters") {
+			v := d.Get("replace_invalid_characters").(bool)
+			opts.Set.CSVReplaceInvalidCharacters = &v
+			runSet = true
+		}
+		if d.HasChange("empty_field_as_null") {
+			v := d.Get("empty_field_as_null").(bool)
+			opts.Set.CSVEmptyFieldAsNull = &v
+			runSet = true
+		}
+		if d.HasChange("skip_byte_order_mark") {
+			v := d.Get("skip_byte_order_mark").(bool)
+			opts.Set.CSVSkipByteOrderMark = &v
+			runSet = true
+		}
+		if d.HasChange("encoding") {
+			v := sdk.CSVEncoding(d.Get("encoding").(string))
+			opts.Set.CSVEncoding = &v
+			runSet = true
+		}
+	case sdk.FileFormatTypeJSON:
+		if d.HasChange("compression") {
+			comp := sdk.JSONCompression(d.Get("compression").(string))
+			opts.Set.JSONCompression = &comp
+			runSet = true
+		}
+		if d.HasChange("date_format") {
+			v := d.Get("date_format").(string)
+			opts.Set.JSONDateFormat = &v
+			runSet = true
+		}
+		if d.HasChange("time_format") {
+			v := d.Get("time_format").(string)
+			opts.Set.JSONTimeFormat = &v
+			runSet = true
+		}
+		if d.HasChange("timestamp_format") {
+			v := d.Get("timestamp_format").(string)
+			opts.Set.JSONTimestampFormat = &v
+			runSet = true
+		}
+		if d.HasChange("binary_format") {
+			v := sdk.BinaryFormat(d.Get("binary_format").(string))
+			opts.Set.JSONBinaryFormat = &v
+			runSet = true
+		}
+		if d.HasChange("trim_space") {
+			v := d.Get("trim_space").(bool)
+			opts.Set.JSONTrimSpace = &v
+			runSet = true
+		}
+		if d.HasChange("null_if") {
+			nullIf := []sdk.NullString{}
+			for _, s := range d.Get("null_if").([]interface{}) {
+				if s == nil {
+					s = ""
+				} else {
+					s = s.(string)
+				}
+				nullIf = append(nullIf, sdk.NullString{S: s.(string)})
+			}
+			opts.Set.JSONNullIf = nullIf
+			runSet = true
+		}
+		if d.HasChange("file_extension") {
+			v := d.Get("file_extension").(string)
+			opts.Set.JSONFileExtension = &v
+			runSet = true
+		}
+		if d.HasChange("enable_octal") {
+			v := d.Get("enable_octal").(bool)
+			opts.Set.JSONEnableOctal = &v
+			runSet = true
+		}
+		if d.HasChange("allow_duplicate") {
+			v := d.Get("allow_duplicate").(bool)
+			opts.Set.JSONAllowDuplicate = &v
+			runSet = true
+		}
+		if d.HasChange("strip_outer_array") {
+			v := d.Get("strip_outer_array").(bool)
+			opts.Set.JSONStripOuterArray = &v
+			runSet = true
+		}
+		if d.HasChange("strip_null_values") {
+			v := d.Get("strip_null_values").(bool)
+			opts.Set.JSONStripNullValues = &v
+			runSet = true
+		}
+		if d.HasChange("replace_invalid_characters") {
+			v := d.Get("replace_invalid_characters").(bool)
+			opts.Set.JSONReplaceInvalidCharacters = &v
+			runSet = true
+		}
+		if d.HasChange("ignore_utf8_errors") {
+			v := d.Get("ignore_utf8_errors").(bool)
+			opts.Set.JSONIgnoreUTF8Errors = &v
+			runSet = true
+		}
+		if d.HasChange("skip_byte_order_mark") {
+			v := d.Get("skip_byte_order_mark").(bool)
+			opts.Set.JSONSkipByteOrderMark = &v
+			runSet = true
+		}
+	case sdk.FileFormatTypeAvro:
+		if d.HasChange("compression") {
+			comp := sdk.AvroCompression(d.Get("compression").(string))
+			opts.Set.AvroCompression = &comp
+			runSet = true
+		}
+		if d.HasChange("trim_space") {
+			v := d.Get("trim_space").(bool)
+			opts.Set.AvroTrimSpace = &v
+			runSet = true
+		}
+		if d.HasChange("null_if") {
+			nullIf := []sdk.NullString{}
+			for _, s := range d.Get("null_if").([]interface{}) {
+				if s == nil {
+					s = ""
+				} else {
+					s = s.(string)
+				}
+				nullIf = append(nullIf, sdk.NullString{S: s.(string)})
+			}
+			opts.Set.AvroNullIf = &nullIf
+			runSet = true
+		}
+	case sdk.FileFormatTypeORC:
+		if d.HasChange("trim_space") {
+			v := d.Get("trim_space").(bool)
+			opts.Set.ORCTrimSpace = &v
+			runSet = true
+		}
+		if d.HasChange("null_if") {
+			nullIf := []sdk.NullString{}
+			for _, s := range d.Get("null_if").([]interface{}) {
+				if s == nil {
+					s = ""
+				} else {
+					s = s.(string)
+				}
+				nullIf = append(nullIf, sdk.NullString{S: s.(string)})
+			}
+			opts.Set.ORCNullIf = &nullIf
+			runSet = true
+		}
+	case sdk.FileFormatTypeParquet:
+		if d.HasChange("compression") {
+			comp := sdk.ParquetCompression(d.Get("compression").(string))
+			opts.Set.ParquetCompression = &comp
+			runSet = true
+		}
+		if d.HasChange("binary_as_text") {
+			v := d.Get("binary_as_text").(bool)
+			opts.Set.ParquetBinaryAsText = &v
+			runSet = true
+		}
+		if d.HasChange("trim_space") {
+			v := d.Get("trim_space").(bool)
+			opts.Set.ParquetTrimSpace = &v
+			runSet = true
+		}
+		if d.HasChange("null_if") {
+			nullIf := []sdk.NullString{}
+			for _, s := range d.Get("null_if").([]interface{}) {
+				if s == nil {
+					s = ""
+				} else {
+					s = s.(string)
+				}
+				nullIf = append(nullIf, sdk.NullString{S: s.(string)})
+			}
+			opts.Set.ParquetNullIf = &nullIf
+			runSet = true
+		}
+	case sdk.FileFormatTypeXML:
+		if d.HasChange("compression") {
+			comp := sdk.XMLCompression(d.Get("compression").(string))
+			opts.Set.XMLCompression = &comp
+			runSet = true
+		}
+		if d.HasChange("ignore_utf8_errors") {
+			v := d.Get("ignore_utf8_errors").(bool)
+			opts.Set.XMLIgnoreUTF8Errors = &v
+			runSet = true
+		}
+		if d.HasChange("preserve_space") {
+			v := d.Get("preserve_space").(bool)
+			opts.Set.XMLPreserveSpace = &v
+			runSet = true
+		}
+		if d.HasChange("strip_outer_element") {
+			v := d.Get("strip_outer_element").(bool)
+			opts.Set.XMLStripOuterElement = &v
+			runSet = true
+		}
+		if d.HasChange("disable_snowflake_data") {
+			v := d.Get("disable_snowflake_data").(bool)
+			opts.Set.XMLDisableSnowflakeData = &v
+			runSet = true
+		}
+		if d.HasChange("disable_auto_convert") {
+			v := d.Get("disable_auto_convert").(bool)
+			opts.Set.XMLDisableAutoConvert = &v
+			runSet = true
+		}
+		if d.HasChange("skip_byte_order_mark") {
+			v := d.Get("skip_byte_order_mark").(bool)
+			opts.Set.XMLSkipByteOrderMark = &v
+			runSet = true
 		}
 	}
 
-	if data.HasChange("record_delimiter") {
-		change := data.Get("record_delimiter")
-		q := builder.ChangeRecordDelimiter(change.(string))
-		err := snowflake.Exec(db, q)
+	if d.HasChange("comment") {
+		v := d.Get("comment").(string)
+		opts.Set.Comment = &v
+		runSet = true
+	}
+
+	if runSet {
+		err = client.FileFormats.Alter(ctx, id, &opts)
 		if err != nil {
-			return errors.Wrapf(err, "error updating file format record delimiter on %v", data.Id())
+			return diag.FromErr(err)
 		}
 	}
 
-	if data.HasChange("field_delimiter") {
-		change := data.Get("field_delimiter")
-		q := builder.ChangeFieldDelimiter(change.(string))
-		err := snowflake.Exec(db, q)
-		if err != nil {
-			return errors.Wrapf(err, "error updating file format field delimiter on %v", data.Id())
-		}
-	}
-
-	if data.HasChange("file_extension") {
-		change := data.Get("file_extension")
-		q := builder.ChangeFileExtension(change.(string))
-		err := snowflake.Exec(db, q)
-		if err != nil {
-			return errors.Wrapf(err, "error updating file format file extension on %v", data.Id())
-		}
-
-	}
-
-	if data.HasChange("skip_header") {
-		change := data.Get("skip_header")
-		q := builder.ChangeSkipHeader(change.(int))
-		err := snowflake.Exec(db, q)
-		if err != nil {
-			return errors.Wrapf(err, "error updating file format skip header on %v", data.Id())
-		}
-	}
-
-	if data.HasChange("skip_blank_lines") {
-		change := data.Get("skip_blank_lines")
-		q := builder.ChangeSkipBlankLines(change.(bool))
-		err := snowflake.Exec(db, q)
-		if err != nil {
-			return errors.Wrapf(err, "error updating file format skip blank lines on %v", data.Id())
-		}
-	}
-
-	if data.HasChange("date_format") {
-		change := data.Get("date_format")
-		q := builder.ChangeDateFormat(change.(string))
-		err := snowflake.Exec(db, q)
-		if err != nil {
-			return errors.Wrapf(err, "error updating file format date format on %v", data.Id())
-		}
-	}
-
-	if data.HasChange("time_format") {
-		change := data.Get("time_format")
-		q := builder.ChangeTimeFormat(change.(string))
-		err := snowflake.Exec(db, q)
-		if err != nil {
-			return errors.Wrapf(err, "error updating file format time format on %v", data.Id())
-		}
-	}
-
-	if data.HasChange("timestamp_format") {
-		change := data.Get("timestamp_format")
-		q := builder.ChangeTimestampFormat(change.(string))
-		err := snowflake.Exec(db, q)
-		if err != nil {
-			return errors.Wrapf(err, "error updating file format timstamp format on %v", data.Id())
-		}
-	}
-
-	if data.HasChange("binary_format") {
-		change := data.Get("binary_format")
-		q := builder.ChangeBinaryFormat(change.(string))
-		err := snowflake.Exec(db, q)
-		if err != nil {
-			return errors.Wrapf(err, "error updating file format binary format on %v", data.Id())
-		}
-	}
-
-	if data.HasChange("escape") {
-		change := data.Get("escape")
-		q := builder.ChangeEscape(change.(string))
-		err := snowflake.Exec(db, q)
-		if err != nil {
-			return errors.Wrapf(err, "error updating file format escape on %v", data.Id())
-		}
-	}
-
-	if data.HasChange("escape_unenclosed_field") {
-		change := data.Get("escape_unenclosed_field")
-		q := builder.ChangeEscapeUnenclosedField(change.(string))
-		err := snowflake.Exec(db, q)
-		if err != nil {
-			return errors.Wrapf(err, "error updating file format escape_unenclosed_field on %v", data.Id())
-		}
-	}
-
-	if data.HasChange("field_optionally_enclosed_by") {
-		change := data.Get("field_optionally_enclosed_by")
-		q := builder.ChangeFieldOptionallyEnclosedBy(change.(string))
-		err := snowflake.Exec(db, q)
-		if err != nil {
-			return errors.Wrapf(err, "error updating file format field_optionally_enclosed_by on %v", data.Id())
-		}
-	}
-
-	if data.HasChange("encoding") {
-		change := data.Get("encoding")
-		q := builder.ChangeEncoding(change.(string))
-		err := snowflake.Exec(db, q)
-		if err != nil {
-			return errors.Wrapf(err, "error updating file format encoding on %v", data.Id())
-		}
-	}
-
-	if data.HasChange("comment") {
-		change := data.Get("comment")
-		q := builder.ChangeComment(change.(string))
-		err := snowflake.Exec(db, q)
-		if err != nil {
-			return errors.Wrapf(err, "error updating file format comment on %v", data.Id())
-		}
-	}
-
-	if data.HasChange("trim_space") {
-		change := data.Get("trim_space")
-		q := builder.ChangeTrimSpace(change.(bool))
-		err := snowflake.Exec(db, q)
-		if err != nil {
-			return errors.Wrapf(err, "error updating file format trim_space on %v", data.Id())
-		}
-	}
-
-	if data.HasChange("error_on_column_count_mismatch") {
-		change := data.Get("error_on_column_count_mismatch")
-		q := builder.ChangeErrorOnColumnCountMismatch(change.(bool))
-		err := snowflake.Exec(db, q)
-		if err != nil {
-			return errors.Wrapf(err, "error updating file format error_on_column_count_mismatch on %v", data.Id())
-		}
-	}
-
-	if data.HasChange("replace_invalid_characters") {
-		change := data.Get("replace_invalid_characters")
-		q := builder.ChangeReplaceInvalidCharacters(change.(bool))
-		err := snowflake.Exec(db, q)
-		if err != nil {
-			return errors.Wrapf(err, "error updating file format replace_invalid_characters on %v", data.Id())
-		}
-	}
-
-	if data.HasChange("validate_utf8") {
-		change := data.Get("validate_utf8")
-		q := builder.ChangeValidateUTF8(change.(bool))
-		err := snowflake.Exec(db, q)
-		if err != nil {
-			return errors.Wrapf(err, "error updating file format validate_utf8 on %v", data.Id())
-		}
-	}
-
-	if data.HasChange("empty_field_as_null") {
-		change := data.Get("empty_field_as_null")
-		q := builder.ChangeEmptyFieldAsNull(change.(bool))
-		err := snowflake.Exec(db, q)
-		if err != nil {
-			return errors.Wrapf(err, "error updating file format empty_field_as_null on %v", data.Id())
-		}
-	}
-
-	if data.HasChange("skip_byte_order_mark") {
-		change := data.Get("skip_byte_order_mark")
-		q := builder.ChangeSkipByteOrderMark(change.(bool))
-		err := snowflake.Exec(db, q)
-		if err != nil {
-			return errors.Wrapf(err, "error updating file format skip_byte_order_mark on %v", data.Id())
-		}
-	}
-
-	if data.HasChange("enable_octal") {
-		change := data.Get("enable_octal")
-		q := builder.ChangeEnableOctal(change.(bool))
-		err := snowflake.Exec(db, q)
-		if err != nil {
-			return errors.Wrapf(err, "error updating file format enable_octal on %v", data.Id())
-		}
-	}
-
-	if data.HasChange("allow_duplicate") {
-		change := data.Get("allow_duplicate")
-		q := builder.ChangeAllowDuplicate(change.(bool))
-		err := snowflake.Exec(db, q)
-		if err != nil {
-			return errors.Wrapf(err, "error updating file format allow_duplicate on %v", data.Id())
-		}
-	}
-
-	if data.HasChange("strip_outer_array") {
-		change := data.Get("strip_outer_array")
-		q := builder.ChangeStripOuterArray(change.(bool))
-		err := snowflake.Exec(db, q)
-		if err != nil {
-			return errors.Wrapf(err, "error updating file format strip_outer_array on %v", data.Id())
-		}
-	}
-
-	if data.HasChange("strip_null_values") {
-		change := data.Get("strip_null_values")
-		q := builder.ChangeStripNullValues(change.(bool))
-		err := snowflake.Exec(db, q)
-		if err != nil {
-			return errors.Wrapf(err, "error updating file format strip_null_values on %v", data.Id())
-		}
-	}
-
-	if data.HasChange("ignore_utf8_errors") {
-		change := data.Get("ignore_utf8_errors")
-		q := builder.ChangeIgnoreUTF8Errors(change.(bool))
-		err := snowflake.Exec(db, q)
-		if err != nil {
-			return errors.Wrapf(err, "error updating file format ignore_utf8_errors on %v", data.Id())
-		}
-	}
-
-	if data.HasChange("binary_as_text") {
-		change := data.Get("binary_as_text")
-		q := builder.ChangeBinaryAsText(change.(bool))
-		err := snowflake.Exec(db, q)
-		if err != nil {
-			return errors.Wrapf(err, "error updating file format binary_as_text on %v", data.Id())
-		}
-	}
-
-	if data.HasChange("preserve_space") {
-		change := data.Get("preserve_space")
-		q := builder.ChangePreserveSpace(change.(bool))
-		err := snowflake.Exec(db, q)
-		if err != nil {
-			return errors.Wrapf(err, "error updating file format preserve_space on %v", data.Id())
-		}
-	}
-
-	if data.HasChange("strip_outer_element") {
-		change := data.Get("strip_outer_element")
-		q := builder.ChangeStripOuterElement(change.(bool))
-		err := snowflake.Exec(db, q)
-		if err != nil {
-			return errors.Wrapf(err, "error updating file format strip_outer_element on %v", data.Id())
-		}
-	}
-
-	if data.HasChange("disable_snowflake_data") {
-		change := data.Get("disable_snowflake_data")
-		q := builder.ChangeDisableSnowflakeData(change.(bool))
-		err := snowflake.Exec(db, q)
-		if err != nil {
-			return errors.Wrapf(err, "error updating file format disable_snowflake_data on %v", data.Id())
-		}
-	}
-
-	if data.HasChange("disable_auto_convert") {
-		change := data.Get("disable_auto_convert")
-		q := builder.ChangeDisableAutoConvert(change.(bool))
-		err := snowflake.Exec(db, q)
-		if err != nil {
-			return errors.Wrapf(err, "error updating file format disable_auto_convert on %v", data.Id())
-		}
-	}
-
-	if data.HasChange("null_if") {
-		change := data.Get("null_if")
-		q := builder.ChangeNullIf(expandStringList(change.([]interface{})))
-		err := snowflake.Exec(db, q)
-		if err != nil {
-			return errors.Wrapf(err, "error updating file format null_if on %v", data.Id())
-		}
-	}
-
-	return ReadFileFormat(data, meta)
+	return ReadFileFormat(ctx, d, meta)
 }
 
-// DeleteFileFormat implements schema.DeleteFunc
-func DeleteFileFormat(data *schema.ResourceData, meta interface{}) error {
-	db := meta.(*sql.DB)
-	fileFormatID, err := fileFormatIDFromString(data.Id())
+// DeleteFileFormat implements schema.DeleteFunc.
+func DeleteFileFormat(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	client := meta.(*provider.Context).Client
+
+	fileFormatID, err := fileFormatIDFromString(d.Id())
 	if err != nil {
-		return err
+		return diag.FromErr(err)
+	}
+	id := sdk.NewSchemaObjectIdentifier(fileFormatID.DatabaseName, fileFormatID.SchemaName, fileFormatID.FileFormatName)
+
+	err = client.FileFormats.Drop(ctx, id, nil)
+	if err != nil {
+		return diag.FromErr(fmt.Errorf("error while deleting file format: %w", err))
 	}
 
-	dbName := fileFormatID.DatabaseName
-	schemaName := fileFormatID.SchemaName
-	fileFormatName := fileFormatID.FileFormatName
-
-	q := snowflake.FileFormat(fileFormatName, dbName, schemaName).Drop()
-
-	err = snowflake.Exec(db, q)
-	if err != nil {
-		return errors.Wrapf(err, "error deleting file format %v", data.Id())
-	}
-
-	data.SetId("")
+	d.SetId("")
 
 	return nil
-}
-
-// FileFormatExists implements schema.ExistsFunc
-func FileFormatExists(data *schema.ResourceData, meta interface{}) (bool, error) {
-	db := meta.(*sql.DB)
-	fileFormatID, err := fileFormatIDFromString(data.Id())
-	if err != nil {
-		return false, err
-	}
-
-	dbName := fileFormatID.DatabaseName
-	schemaName := fileFormatID.SchemaName
-	fileFormatName := fileFormatID.FileFormatName
-
-	q := snowflake.FileFormat(fileFormatName, dbName, schemaName).Describe()
-	rows, err := db.Query(q)
-	if err != nil {
-		return false, err
-	}
-	defer rows.Close()
-
-	if rows.Next() {
-		return true, nil
-	}
-
-	return false, nil
 }
 
 func fileFormatIDFromString(stringID string) (*fileFormatID, error) {
@@ -1105,7 +1148,7 @@ func fileFormatIDFromString(stringID string) (*fileFormatID, error) {
 	reader.Comma = fileFormatIDDelimiter
 	lines, err := reader.ReadAll()
 	if err != nil {
-		return nil, fmt.Errorf("Not CSV compatible")
+		return nil, fmt.Errorf("not CSV compatible")
 	}
 
 	if len(lines) != 1 {

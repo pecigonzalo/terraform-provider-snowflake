@@ -1,10 +1,20 @@
 package datasources
 
 import (
+	"context"
 	"database/sql"
+	"errors"
 	"log"
 
-	"github.com/chanzuckerberg/terraform-provider-snowflake/pkg/snowflake"
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/provider/datasources"
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/provider/previewfeatures"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
+
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/sdk"
+
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/internal/provider"
+
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/snowflake"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 )
 
@@ -23,21 +33,23 @@ var systemGenerateSCIMAccesstokenSchema = map[string]*schema.Schema{
 
 func SystemGenerateSCIMAccessToken() *schema.Resource {
 	return &schema.Resource{
-		Read:   ReadSystemGenerateSCIMAccessToken,
-		Schema: systemGenerateSCIMAccesstokenSchema,
+		ReadContext: PreviewFeatureReadWrapper(string(previewfeatures.SystemGenerateSCIMAccessTokenDatasource), TrackingReadWrapper(datasources.SystemGenerateScimAccessToken, ReadSystemGenerateSCIMAccessToken)),
+		Schema:      systemGenerateSCIMAccesstokenSchema,
 	}
 }
 
-// ReadSystemGetAWSSNSIAMPolicy implements schema.ReadFunc
-func ReadSystemGenerateSCIMAccessToken(d *schema.ResourceData, meta interface{}) error {
-	db := meta.(*sql.DB)
-	integrationName := d.Get("integration_name").(string)
+// ReadSystemGetAWSSNSIAMPolicy implements schema.ReadFunc.
+func ReadSystemGenerateSCIMAccessToken(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	client := meta.(*provider.Context).Client
+	db := client.GetConn().DB
 
-	sel := snowflake.SystemGenerateSCIMAccessToken(integrationName).Select()
+	integrationName := sdk.NewAccountObjectIdentifier(d.Get("integration_name").(string)).Name()
+
+	sel := snowflake.NewSystemGenerateSCIMAccessTokenBuilder(integrationName).Select()
 	row := snowflake.QueryRow(db, sel)
 	accessToken, err := snowflake.ScanSCIMAccessToken(row)
-	if err == sql.ErrNoRows {
-		// If not found, mark resource to be removed from statefile during apply or refresh
+	if errors.Is(err, sql.ErrNoRows) {
+		// If not found, mark resource to be removed from state file during apply or refresh
 		log.Printf("[DEBUG] system_generate_scim_access_token (%s) not found", d.Id())
 		d.SetId("")
 		return nil
@@ -50,5 +62,5 @@ func ReadSystemGenerateSCIMAccessToken(d *schema.ResourceData, meta interface{})
 	}
 
 	d.SetId(integrationName)
-	return d.Set("access_token", accessToken.Token)
+	return diag.FromErr(d.Set("access_token", accessToken.Token))
 }

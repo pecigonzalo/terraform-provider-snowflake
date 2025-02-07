@@ -1,31 +1,51 @@
 package resources_test
 
 import (
+	"context"
 	"fmt"
-	"os"
 	"strings"
 	"testing"
 
-	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/acctest"
-	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/resource"
+	acc "github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/acceptance"
+
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/acceptance/testenvs"
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/internal/provider"
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/sdk"
+	"github.com/hashicorp/terraform-plugin-testing/helper/acctest"
+	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
+	"github.com/hashicorp/terraform-plugin-testing/terraform"
+	"github.com/hashicorp/terraform-plugin-testing/tfversion"
 )
 
-func TestAcc_NetworkPolicyAttachment(t *testing.T) {
-	if _, ok := os.LookupEnv("SKIP_NETWORK_POLICY_TESTS"); ok {
-		t.Skip("Skipping TestAccNetworkPolicyAttachment")
-	}
+func TestAcc_NetworkPolicyAttachmentUser(t *testing.T) {
+	_ = testenvs.GetOrSkipTest(t, testenvs.EnableAcceptance)
 
-	user1 := strings.ToUpper(acctest.RandStringFromCharSet(10, acctest.CharSetAlpha))
-	user2 := strings.ToUpper(acctest.RandStringFromCharSet(10, acctest.CharSetAlpha))
-	policyName := strings.ToUpper(acctest.RandStringFromCharSet(10, acctest.CharSetAlpha))
+	user1, user1Cleanup := acc.TestClient().User.CreateUser(t)
+	t.Cleanup(user1Cleanup)
+	user2, user2Cleanup := acc.TestClient().User.CreateUser(t)
+	t.Cleanup(user2Cleanup)
+	policyId := acc.TestClient().Ids.RandomAccountObjectIdentifier()
 
-	resource.ParallelTest(t, resource.TestCase{
-		Providers: providers(),
+	resource.Test(t, resource.TestCase{
+		ProtoV6ProviderFactories: acc.TestAccProtoV6ProviderFactories,
+		PreCheck:                 func() { acc.TestAccPreCheck(t) },
+		TerraformVersionChecks: []tfversion.TerraformVersionCheck{
+			tfversion.RequireAbove(tfversion.Version1_5_0),
+		},
+		CheckDestroy: nil,
 		Steps: []resource.TestStep{
 			{
-				Config: networkPolicyAttachmentConfig(user1, user2, policyName),
+				Config: networkPolicyAttachmentConfigSingle(user1.ID(), policyId),
 				Check: resource.ComposeTestCheckFunc(
-					resource.TestCheckResourceAttr("snowflake_network_policy_attachment.test", "network_policy_name", policyName),
+					resource.TestCheckResourceAttr("snowflake_network_policy_attachment.test", "network_policy_name", policyId.Name()),
+					resource.TestCheckResourceAttr("snowflake_network_policy_attachment.test", "set_for_account", "false"),
+					resource.TestCheckResourceAttr("snowflake_network_policy_attachment.test", "users.#", "1"),
+				),
+			},
+			{
+				Config: networkPolicyAttachmentConfig(user1.ID(), user2.ID(), policyId),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("snowflake_network_policy_attachment.test", "network_policy_name", policyId.Name()),
 					resource.TestCheckResourceAttr("snowflake_network_policy_attachment.test", "set_for_account", "false"),
 					resource.TestCheckResourceAttr("snowflake_network_policy_attachment.test", "users.#", "2"),
 				),
@@ -40,25 +60,88 @@ func TestAcc_NetworkPolicyAttachment(t *testing.T) {
 	})
 }
 
-func networkPolicyAttachmentConfig(user1, user2, policyName string) string {
+func TestAcc_NetworkPolicyAttachmentAccount(t *testing.T) {
+	policyNameAccount := strings.ToUpper(acctest.RandStringFromCharSet(10, acctest.CharSetAlpha))
+
+	resource.Test(t, resource.TestCase{
+		ProtoV6ProviderFactories: acc.TestAccProtoV6ProviderFactories,
+		PreCheck:                 func() { acc.TestAccPreCheck(t) },
+		TerraformVersionChecks: []tfversion.TerraformVersionCheck{
+			tfversion.RequireAbove(tfversion.Version1_5_0),
+		},
+		CheckDestroy: testAccCheckNetworkPolicyAttachmentDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: networkPolicyAttachmentConfigAccount(policyNameAccount),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("snowflake_network_policy_attachment.test", "network_policy_name", policyNameAccount),
+					resource.TestCheckResourceAttr("snowflake_network_policy_attachment.test", "set_for_account", "true"),
+				),
+			},
+		},
+	})
+}
+
+func testAccCheckNetworkPolicyAttachmentDestroy(s *terraform.State) error {
+	client := acc.TestAccProvider.Meta().(*provider.Context).Client
+
+	for _, rs := range s.RootModule().Resources {
+		if rs.Type != "snowflake_network_policy_attachment" {
+			continue
+		}
+		ctx := context.Background()
+		parameter, err := client.Parameters.ShowAccountParameter(ctx, sdk.AccountParameterNetworkPolicy)
+		if err != nil {
+			fmt.Printf("[WARN] network policy (%s) not found on account", rs.Primary.Attributes["Id"])
+			return nil
+		}
+		if err == nil && parameter.Level == "ACCOUNT" && parameter.Key == "NETWORK_POLICY" && parameter.Value == rs.Primary.Attributes["network_policy_name"] {
+			return fmt.Errorf("network policy attachment %v still exists", rs.Primary.Attributes["Id"])
+		}
+	}
+	return nil
+}
+
+func networkPolicyAttachmentConfigSingle(user1Id sdk.AccountObjectIdentifier, policyId sdk.AccountObjectIdentifier) string {
 	return fmt.Sprintf(`
-resource "snowflake_user" "test-user1" {
-	name = "%s"
-}
-
-resource "snowflake_user" "test-user2" {
-	name = "%s"
-}
-
 resource "snowflake_network_policy" "test" {
-	name            = "%v"
+	name            = %[2]s
 	allowed_ip_list = ["192.168.0.100/24", "29.254.123.20"]
 }
 
 resource "snowflake_network_policy_attachment" "test" {
 	network_policy_name = snowflake_network_policy.test.name
 	set_for_account     = false
-	users               = [snowflake_user.test-user1.name, snowflake_user.test-user2.name]
+	users               = [%[1]s]
 }
-`, user1, user2, policyName)
+`, user1Id.FullyQualifiedName(), policyId.FullyQualifiedName())
+}
+
+func networkPolicyAttachmentConfig(user1Id sdk.AccountObjectIdentifier, user2Id sdk.AccountObjectIdentifier, policyId sdk.AccountObjectIdentifier) string {
+	return fmt.Sprintf(`
+resource "snowflake_network_policy" "test" {
+	name            = %[3]s
+	allowed_ip_list = ["192.168.0.100/24", "29.254.123.20"]
+}
+
+resource "snowflake_network_policy_attachment" "test" {
+	network_policy_name = snowflake_network_policy.test.name
+	set_for_account     = false
+	users               = [%[1]s, %[2]s]
+}
+`, user1Id.FullyQualifiedName(), user2Id.FullyQualifiedName(), policyId.FullyQualifiedName())
+}
+
+func networkPolicyAttachmentConfigAccount(policyName string) string {
+	return fmt.Sprintf(`
+resource "snowflake_network_policy" "test" {
+	name            = "%v"
+	allowed_ip_list = ["0.0.0.0/0"]
+}
+
+resource "snowflake_network_policy_attachment" "test" {
+	network_policy_name = snowflake_network_policy.test.name
+	set_for_account     = true
+}
+`, policyName)
 }

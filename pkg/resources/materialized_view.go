@@ -1,16 +1,22 @@
 package resources
 
 import (
-	"bytes"
-	"database/sql"
-	"encoding/csv"
+	"context"
 	"fmt"
 	"log"
-	"strings"
 
-	"github.com/chanzuckerberg/terraform-provider-snowflake/pkg/snowflake"
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/provider/previewfeatures"
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/provider/resources"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/customdiff"
+
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/internal/provider"
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/schemas"
+
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/helpers"
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/sdk"
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/snowflake"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
-	"github.com/pkg/errors"
 )
 
 var materializedViewSchema = map[string]*schema.Schema{
@@ -61,16 +67,21 @@ var materializedViewSchema = map[string]*schema.Schema{
 		ForceNew:         true,
 		DiffSuppressFunc: DiffSuppressStatement,
 	},
-	"tag": tagReferenceSchema,
+	"tag":                           tagReferenceSchema,
+	FullyQualifiedNameAttributeName: schemas.FullyQualifiedNameSchema,
 }
 
-// View returns a pointer to the resource representing a view
+// MaterializedView returns a pointer to the resource representing a view.
 func MaterializedView() *schema.Resource {
 	return &schema.Resource{
-		Create: CreateMaterializedView,
-		Read:   ReadMaterializedView,
-		Update: UpdateMaterializedView,
-		Delete: DeleteMaterializedView,
+		CreateContext: PreviewFeatureCreateContextWrapper(string(previewfeatures.MaterializedViewResource), TrackingCreateWrapper(resources.MaterializedView, CreateMaterializedView)),
+		ReadContext:   PreviewFeatureReadContextWrapper(string(previewfeatures.MaterializedViewResource), TrackingReadWrapper(resources.MaterializedView, ReadMaterializedView)),
+		UpdateContext: PreviewFeatureUpdateContextWrapper(string(previewfeatures.MaterializedViewResource), TrackingUpdateWrapper(resources.MaterializedView, UpdateMaterializedView)),
+		DeleteContext: PreviewFeatureDeleteContextWrapper(string(previewfeatures.MaterializedViewResource), TrackingDeleteWrapper(resources.MaterializedView, DeleteMaterializedView)),
+
+		CustomizeDiff: TrackingCustomDiffWrapper(resources.MaterializedView, customdiff.All(
+			ComputedIfAnyAttributeChanged(materializedViewSchema, FullyQualifiedNameAttributeName, "name"),
+		)),
 
 		Schema: materializedViewSchema,
 		Importer: &schema.ResourceImporter{
@@ -79,250 +90,194 @@ func MaterializedView() *schema.Resource {
 	}
 }
 
-type materializedViewID struct {
-	DatabaseName string
-	SchemaName   string
-	ViewName     string
-}
+// CreateMaterializedView implements schema.CreateFunc.
+func CreateMaterializedView(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	client := meta.(*provider.Context).Client
 
-const (
-	materializedViewDelimiter = '|'
-)
-
-//String() takes in a materializedViewID object and returns a pipe-delimited string:
-//DatabaseName|SchemaName|ExternalTableName
-func (si *materializedViewID) String() (string, error) {
-	var buf bytes.Buffer
-	csvWriter := csv.NewWriter(&buf)
-	csvWriter.Comma = materializedViewDelimiter
-	dataIdentifiers := [][]string{{si.DatabaseName, si.SchemaName, si.ViewName}}
-	err := csvWriter.WriteAll(dataIdentifiers)
-	if err != nil {
-		return "", err
-	}
-	strMeterilizedViewID := strings.TrimSpace(buf.String())
-	return strMeterilizedViewID, nil
-}
-
-// materializedViewIDFromString() takes in a pipe-delimited string: DatabaseName|SchemaName|MaterializedViewName
-// and returns a externalTableID object
-func materializedViewIDFromString(stringID string) (*materializedViewID, error) {
-	reader := csv.NewReader(strings.NewReader(stringID))
-	reader.Comma = materializedViewDelimiter
-	lines, err := reader.ReadAll()
-	if err != nil {
-		return nil, fmt.Errorf("Not CSV compatible")
-	}
-
-	if len(lines) != 1 {
-		return nil, fmt.Errorf("1 line at a time")
-	}
-	if len(lines[0]) != 3 {
-		return nil, fmt.Errorf("3 fields allowed")
-	}
-
-	materializedViewResult := &materializedViewID{
-		DatabaseName: lines[0][0],
-		SchemaName:   lines[0][1],
-		ViewName:     lines[0][2],
-	}
-	return materializedViewResult, nil
-}
-
-// CreateMaterializedView implements schema.CreateFunc
-func CreateMaterializedView(d *schema.ResourceData, meta interface{}) error {
-	db := meta.(*sql.DB)
+	databaseName := d.Get("database").(string)
+	schemaName := d.Get("schema").(string)
 	name := d.Get("name").(string)
-	schema := d.Get("schema").(string)
-	database := d.Get("database").(string)
-	warehouse := d.Get("warehouse").(string)
+	id := sdk.NewSchemaObjectIdentifier(databaseName, schemaName, name)
+
 	s := d.Get("statement").(string)
+	createRequest := sdk.NewCreateMaterializedViewRequest(id, s)
 
-	builder := snowflake.MaterializedView(name).WithDB(database).WithSchema(schema).WithWarehouse(warehouse).WithStatement(s)
-
-	// Set optionals
 	if v, ok := d.GetOk("or_replace"); ok && v.(bool) {
-		builder.WithReplace()
+		createRequest.WithOrReplace(sdk.Bool(true))
 	}
 
 	if v, ok := d.GetOk("is_secure"); ok && v.(bool) {
-		builder.WithSecure()
+		createRequest.WithSecure(sdk.Bool(true))
 	}
 
 	if v, ok := d.GetOk("comment"); ok {
-		builder.WithComment(v.(string))
+		createRequest.WithComment(sdk.String(v.(string)))
 	}
 
-	if v, ok := d.GetOk("tag"); ok {
-		tags := getTags(v)
-		builder.WithTags(tags.toSnowflakeTagValues())
-	}
-
-	q := builder.Create()
-	log.Print("[DEBUG] xxx ", q)
-	err := snowflake.ExecMulti(db, q)
+	warehouseName := d.Get("warehouse").(string)
+	// TODO [SNOW-1348355]: this was the old implementation, it's left for now, we will address this with resources rework discussions
+	err := client.Sessions.UseWarehouse(ctx, sdk.NewAccountObjectIdentifier(warehouseName))
 	if err != nil {
-		return errors.Wrapf(err, "error creating view %v", name)
+		return diag.FromErr(fmt.Errorf("error setting warehouse %s while creating materialized view %v err = %w", warehouseName, name, err))
 	}
 
-	materializedViewID := &materializedViewID{
-		DatabaseName: database,
-		SchemaName:   schema,
-		ViewName:     name,
-	}
-	dataIDInput, err := materializedViewID.String()
+	err = client.MaterializedViews.Create(ctx, createRequest)
 	if err != nil {
-		return err
+		return diag.FromErr(fmt.Errorf("error creating materialized view %v err = %w", name, err))
 	}
-	d.SetId(dataIDInput)
 
-	return ReadMaterializedView(d, meta)
+	// TODO [SNOW-1348355]: we have to set tags after creation because existing materialized view extractor is not aware of TAG during CREATE
+	// Will be discussed with parser topic during resources redesign.
+	if _, ok := d.GetOk("tag"); ok {
+		err := client.Views.Alter(ctx, sdk.NewAlterViewRequest(id).WithSetTags(getPropertyTags(d, "tag")))
+		if err != nil {
+			return diag.FromErr(fmt.Errorf("error setting tags on materialized view %v, err = %w", id, err))
+		}
+	}
+
+	d.SetId(helpers.EncodeSnowflakeID(id))
+
+	return ReadMaterializedView(ctx, d, meta)
 }
 
-// ReadMaterializedView implements schema.ReadFunc
-func ReadMaterializedView(d *schema.ResourceData, meta interface{}) error {
-	db := meta.(*sql.DB)
-	materializedViewID, err := materializedViewIDFromString(d.Id())
+// ReadMaterializedView implements schema.ReadFunc.
+func ReadMaterializedView(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	client := meta.(*provider.Context).Client
+
+	id := helpers.DecodeSnowflakeID(d.Id()).(sdk.SchemaObjectIdentifier)
+
+	materializedView, err := client.MaterializedViews.ShowByID(ctx, id)
 	if err != nil {
-		return err
-	}
-
-	dbName := materializedViewID.DatabaseName
-	schema := materializedViewID.SchemaName
-	view := materializedViewID.ViewName
-
-	q := snowflake.MaterializedView(view).WithDB(dbName).WithSchema(schema).Show()
-	row := snowflake.QueryRow(db, q)
-	v, err := snowflake.ScanMaterializedView(row)
-	if err == sql.ErrNoRows {
-		// If not found, mark resource to be removed from statefile during apply or refresh
-		log.Printf("[DEBUG] view (%s) not found", d.Id())
+		log.Printf("[DEBUG] materialized view (%s) not found", d.Id())
 		d.SetId("")
 		return nil
 	}
-	if err != nil {
-		return err
+	if err := d.Set(FullyQualifiedNameAttributeName, id.FullyQualifiedName()); err != nil {
+		return diag.FromErr(err)
+	}
+	if err := d.Set("name", materializedView.Name); err != nil {
+		return diag.FromErr(err)
 	}
 
-	err = d.Set("name", v.Name.String)
-	if err != nil {
-		return err
+	if err := d.Set("is_secure", materializedView.IsSecure); err != nil {
+		return diag.FromErr(err)
 	}
 
-	err = d.Set("is_secure", v.IsSecure)
-	if err != nil {
-		return err
+	if err := d.Set("comment", materializedView.Comment); err != nil {
+		return diag.FromErr(err)
 	}
 
-	err = d.Set("comment", v.Comment.String)
-	if err != nil {
-		return err
+	if err := d.Set("schema", materializedView.SchemaName); err != nil {
+		return diag.FromErr(err)
 	}
 
-	err = d.Set("schema", v.SchemaName.String)
-	if err != nil {
-		return err
+	if err := d.Set("database", materializedView.DatabaseName); err != nil {
+		return diag.FromErr(err)
 	}
 
-	// Want to only capture the Select part of the query because before that is the Create part of the view which we no longer care about
-
-	extractor := snowflake.NewViewSelectStatementExtractor(v.Text.String)
+	// Want to only capture the SELECT part of the query because before that is the CREATE part of the view.
+	extractor := snowflake.NewViewSelectStatementExtractor(materializedView.Text)
 	substringOfQuery, err := extractor.ExtractMaterializedView()
 	if err != nil {
-		return err
+		return diag.FromErr(err)
 	}
 
-	err = d.Set("statement", substringOfQuery)
-	if err != nil {
-		return err
+	if err := d.Set("statement", substringOfQuery); err != nil {
+		return diag.FromErr(err)
 	}
 
-	return d.Set("database", v.DatabaseName.String)
+	return nil
 }
 
-// UpdateMaterializedView implements schema.UpdateFunc
-func UpdateMaterializedView(d *schema.ResourceData, meta interface{}) error {
-	materializedViewID, err := materializedViewIDFromString(d.Id())
-	if err != nil {
-		return err
-	}
+// UpdateMaterializedView implements schema.UpdateFunc.
+func UpdateMaterializedView(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	client := meta.(*provider.Context).Client
 
-	dbName := materializedViewID.DatabaseName
-	schema := materializedViewID.SchemaName
-	view := materializedViewID.ViewName
+	id := helpers.DecodeSnowflakeID(d.Id()).(sdk.SchemaObjectIdentifier)
 
-	builder := snowflake.MaterializedView(view).WithDB(dbName).WithSchema(schema)
-
-	db := meta.(*sql.DB)
 	if d.HasChange("name") {
-		name := d.Get("name")
+		newId := sdk.NewSchemaObjectIdentifierInSchema(id.SchemaId(), d.Get("name").(string))
 
-		q := builder.Rename(name.(string))
-		err := snowflake.Exec(db, q)
+		err := client.MaterializedViews.Alter(ctx, sdk.NewAlterMaterializedViewRequest(id).WithRenameTo(&newId))
 		if err != nil {
-			return errors.Wrapf(err, "error renaming view %v", d.Id())
+			return diag.FromErr(fmt.Errorf("error renaming materialized view %v err = %w", d.Id(), err))
 		}
 
-		d.SetId(fmt.Sprintf("%v|%v|%v", dbName, schema, name.(string)))
+		d.SetId(helpers.EncodeSnowflakeID(newId))
+		id = newId
 	}
 
-	if d.HasChange("comment") {
-		comment := d.Get("comment")
+	var runSetStatement bool
+	var runUnsetStatement bool
+	setRequest := sdk.NewMaterializedViewSetRequest()
+	unsetRequest := sdk.NewMaterializedViewUnsetRequest()
 
-		if c := comment.(string); c == "" {
-			q := builder.RemoveComment()
-			err := snowflake.Exec(db, q)
-			if err != nil {
-				return errors.Wrapf(err, "error unsetting comment for view %v", d.Id())
-			}
+	if d.HasChange("comment") {
+		comment := d.Get("comment").(string)
+		if comment == "" {
+			runUnsetStatement = true
+			unsetRequest.WithComment(sdk.Bool(true))
 		} else {
-			q := builder.ChangeComment(c)
-			err := snowflake.Exec(db, q)
-			if err != nil {
-				return errors.Wrapf(err, "error updating comment for view %v", d.Id())
-			}
+			runSetStatement = true
+			setRequest.WithComment(sdk.String(comment))
 		}
 	}
 	if d.HasChange("is_secure") {
-		secure := d.Get("is_secure")
-
-		if secure.(bool) {
-			q := builder.Secure()
-			err := snowflake.Exec(db, q)
-			if err != nil {
-				return errors.Wrapf(err, "error setting secure for view %v", d.Id())
-			}
+		if d.Get("is_secure").(bool) {
+			runSetStatement = true
+			setRequest.WithSecure(sdk.Bool(true))
 		} else {
-			q := builder.Unsecure()
-			err := snowflake.Exec(db, q)
+			runUnsetStatement = true
+			unsetRequest.WithSecure(sdk.Bool(true))
+		}
+	}
+
+	if runSetStatement {
+		err := client.MaterializedViews.Alter(ctx, sdk.NewAlterMaterializedViewRequest(id).WithSet(setRequest))
+		if err != nil {
+			return diag.FromErr(fmt.Errorf("error updating materialized view: %w", err))
+		}
+	}
+
+	if runUnsetStatement {
+		err := client.MaterializedViews.Alter(ctx, sdk.NewAlterMaterializedViewRequest(id).WithUnset(unsetRequest))
+		if err != nil {
+			return diag.FromErr(fmt.Errorf("error updating materialized view: %w", err))
+		}
+	}
+
+	if d.HasChange("tag") {
+		unsetTags, setTags := GetTagsDiff(d, "tag")
+
+		if len(unsetTags) > 0 {
+			// TODO [SNOW-1022645]: view is used on purpose here; change after we have an agreement on situations like this in the SDK
+			err := client.Views.Alter(ctx, sdk.NewAlterViewRequest(id).WithUnsetTags(unsetTags))
 			if err != nil {
-				return errors.Wrapf(err, "error unsetting secure for materialized view %v", d.Id())
+				return diag.FromErr(fmt.Errorf("error unsetting tags on %v, err = %w", d.Id(), err))
+			}
+		}
+
+		if len(setTags) > 0 {
+			// TODO [SNOW-1022645]: view is used on purpose here; change after we have an agreement on situations like this in the SDK
+			err := client.Views.Alter(ctx, sdk.NewAlterViewRequest(id).WithSetTags(setTags))
+			if err != nil {
+				return diag.FromErr(fmt.Errorf("error setting tags on %v, err = %w", d.Id(), err))
 			}
 		}
 	}
 
-	handleTagChanges(db, d, builder)
-
-	return ReadMaterializedView(d, meta)
+	return ReadMaterializedView(ctx, d, meta)
 }
 
-// DeleteMaterializedView implements schema.DeleteFunc
-func DeleteMaterializedView(d *schema.ResourceData, meta interface{}) error {
-	db := meta.(*sql.DB)
-	materializedViewID, err := materializedViewIDFromString(d.Id())
+// DeleteMaterializedView implements schema.DeleteFunc.
+func DeleteMaterializedView(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	client := meta.(*provider.Context).Client
+
+	id := helpers.DecodeSnowflakeID(d.Id()).(sdk.SchemaObjectIdentifier)
+
+	err := client.MaterializedViews.Drop(ctx, sdk.NewDropMaterializedViewRequest(id))
 	if err != nil {
-		return err
-	}
-
-	dbName := materializedViewID.DatabaseName
-	schema := materializedViewID.SchemaName
-	view := materializedViewID.ViewName
-
-	q := snowflake.MaterializedView(view).WithDB(dbName).WithSchema(schema).Drop()
-
-	err = snowflake.Exec(db, q)
-	if err != nil {
-		return errors.Wrapf(err, "error deleting materialized view %v", d.Id())
+		return diag.FromErr(err)
 	}
 
 	d.SetId("")

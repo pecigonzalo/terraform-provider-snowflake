@@ -1,2 +1,1 @@
-# format is dbName | schemaName
-terraform import snowflake_schema.example 'dbName|schemaName'
+terraform import snowflake_schema.example '"<database_name>"."<schema_name>"'

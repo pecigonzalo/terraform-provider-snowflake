@@ -1,11 +1,16 @@
 package datasources
 
 import (
-	"database/sql"
+	"context"
 	"fmt"
-	"log"
 
-	"github.com/chanzuckerberg/terraform-provider-snowflake/pkg/snowflake"
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/provider/datasources"
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/provider/previewfeatures"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
+
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/internal/provider"
+
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/sdk"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 )
 
@@ -41,47 +46,44 @@ var storageIntegrationsSchema = map[string]*schema.Schema{
 
 func StorageIntegrations() *schema.Resource {
 	return &schema.Resource{
-		Read:   ReadStorageIntegrations,
-		Schema: storageIntegrationsSchema,
+		ReadContext: PreviewFeatureReadWrapper(string(previewfeatures.StorageIntegrationsDatasource), TrackingReadWrapper(datasources.StorageIntegrations, ReadStorageIntegrations)),
+		Schema:      storageIntegrationsSchema,
 	}
 }
 
-func ReadStorageIntegrations(d *schema.ResourceData, meta interface{}) error {
-	db := meta.(*sql.DB)
+func ReadStorageIntegrations(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	client := meta.(*provider.Context).Client
 
-	account, err := snowflake.ReadCurrentAccount(db)
+	account, err := client.ContextFunctions.CurrentAccount(ctx)
 	if err != nil {
-		log.Print("[DEBUG] unable to retrieve current account")
 		d.SetId("")
-		return nil
+		return diag.FromErr(fmt.Errorf("[DEBUG] unable to retrieve current account"))
 	}
 
-	d.SetId(fmt.Sprintf("%s.%s", account.Account, account.Region))
-
-	currentStorageIntegrations, err := snowflake.ListStorageIntegrations(db)
-	if err == sql.ErrNoRows {
-		// If not found, mark resource to be removed from statefile during apply or refresh
-		log.Printf("[DEBUG] no storage integrations found in account (%s)", d.Id())
+	region, err := client.ContextFunctions.CurrentRegion(ctx)
+	if err != nil {
 		d.SetId("")
-		return nil
-	} else if err != nil {
-		log.Printf("[DEBUG] unable to parse storage integrations in account (%s)", d.Id())
-		d.SetId("")
-		return nil
+		return diag.FromErr(fmt.Errorf("[DEBUG] unable to retrieve current region"))
 	}
 
-	storageIntegrations := []map[string]interface{}{}
+	d.SetId(fmt.Sprintf("%s.%s", account, region))
 
-	for _, storageIntegration := range currentStorageIntegrations {
-		storageIntegrationMap := map[string]interface{}{}
-
-		storageIntegrationMap["name"] = storageIntegration.Name.String
-		storageIntegrationMap["type"] = storageIntegration.IntegrationType.String
-		storageIntegrationMap["comment"] = storageIntegration.Comment.String
-		storageIntegrationMap["enabled"] = storageIntegration.Enabled.Bool
-
-		storageIntegrations = append(storageIntegrations, storageIntegrationMap)
+	storageIntegrations, err := client.StorageIntegrations.Show(ctx, sdk.NewShowStorageIntegrationRequest())
+	if err != nil {
+		d.SetId("")
+		return diag.FromErr(fmt.Errorf("unable to retrieve storage integrations in account (%s), err = %w", d.Id(), err))
 	}
 
-	return d.Set("storage_integrations", storageIntegrations)
+	storageIntegrationMaps := make([]map[string]any, len(storageIntegrations))
+
+	for i, storageIntegration := range storageIntegrations {
+		storageIntegrationMaps[i] = map[string]any{
+			"name":    storageIntegration.Name,
+			"type":    storageIntegration.StorageType,
+			"enabled": storageIntegration.Enabled,
+			"comment": storageIntegration.Comment,
+		}
+	}
+
+	return diag.FromErr(d.Set("storage_integrations", storageIntegrationMaps))
 }

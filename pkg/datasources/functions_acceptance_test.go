@@ -2,72 +2,72 @@ package datasources_test
 
 import (
 	"fmt"
-	"strings"
 	"testing"
 
-	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/acctest"
-	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/resource"
+	acc "github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/acceptance"
+
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/acceptance/bettertestspoc/config"
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/acceptance/bettertestspoc/config/model"
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/acceptance/testdatatypes"
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/acceptance/testenvs"
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/provider/resources"
+	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
+	"github.com/hashicorp/terraform-plugin-testing/tfversion"
 )
 
-func TestAccFunctions(t *testing.T) {
-	databaseName := strings.ToUpper(acctest.RandStringFromCharSet(10, acctest.CharSetAlpha))
-	schemaName := strings.ToUpper(acctest.RandStringFromCharSet(10, acctest.CharSetAlpha))
-	functionName := strings.ToUpper(acctest.RandStringFromCharSet(10, acctest.CharSetAlpha))
-	functionWithArgumentsName := strings.ToUpper(acctest.RandStringFromCharSet(10, acctest.CharSetAlpha))
-	resource.ParallelTest(t, resource.TestCase{
-		Providers: providers(),
+func TestAcc_Functions(t *testing.T) {
+	_ = testenvs.GetOrSkipTest(t, testenvs.EnableAcceptance)
+	acc.TestAccPreCheck(t)
+	t.Setenv(string(testenvs.ConfigureClientOnce), "")
+
+	dataSourceName := "data.snowflake_functions.functions"
+
+	resource.Test(t, resource.TestCase{
+		ProtoV6ProviderFactories: acc.TestAccProtoV6ProviderFactories,
+		PreCheck:                 func() { acc.TestAccPreCheck(t) },
+		TerraformVersionChecks: []tfversion.TerraformVersionCheck{
+			tfversion.RequireAbove(tfversion.Version1_5_0),
+		},
+		CheckDestroy: acc.CheckDestroy(t, resources.FunctionJava),
 		Steps: []resource.TestStep{
 			{
-				Config: functions(databaseName, schemaName, functionName, functionWithArgumentsName),
+				Config: functionsConfig(t),
 				Check: resource.ComposeTestCheckFunc(
-					resource.TestCheckResourceAttr("data.snowflake_functions.t", "database", databaseName),
-					resource.TestCheckResourceAttr("data.snowflake_functions.t", "schema", schemaName),
-					resource.TestCheckResourceAttrSet("data.snowflake_functions.t", "functions.#"),
-					resource.TestCheckResourceAttr("data.snowflake_functions.t", "functions.#", "2"),
+					resource.TestCheckResourceAttr(dataSourceName, "database", acc.TestDatabaseName),
+					resource.TestCheckResourceAttr(dataSourceName, "schema", acc.TestSchemaName),
+					resource.TestCheckResourceAttrSet(dataSourceName, "functions.#"),
 				),
 			},
 		},
 	})
 }
 
-func functions(databaseName string, schemaName string, functionName string, functionWithArgumentsName string) string {
-	s := `
-resource "snowflake_database" "test_database" {
-	name 	  = "%v"
-	comment = "Terraform acceptance test"
-}
-resource "snowflake_schema" "test_schema" {
-	name 	   = "%v"
-	database = snowflake_database.test_database.name
-	comment  = "Terraform acceptance test"
-}
-resource "snowflake_function" "test_funct_simple" {
-	name = "%s"
-	database = snowflake_database.test_database.name
-	schema   = snowflake_schema.test_schema.name
-	return_type = "float"
-	statement = "3.141592654::FLOAT"
-}
+// TODO [SNOW-1348103]: use generated config builder when reworking the datasource
+func functionsConfig(t *testing.T) string {
+	t.Helper()
 
-resource "snowflake_function" "test_funct" {
-	name = "%s"
-	database = snowflake_database.test_database.name
-	schema   = snowflake_schema.test_schema.name
-	arguments {
-		name = "arg1"
-		type = "varchar"
-	}
-	comment = "Terraform acceptance test"
-	return_type = "varchar"
-	language = "javascript"
-	statement = "var X=3\nreturn X"
-}
+	className := "TestFunc"
+	funcName := "echoVarchar"
+	argName := "x"
+	dataType := testdatatypes.DataTypeVarchar_100
 
-data snowflake_functions "t" {
-	database = snowflake_database.test_database.name
-	schema = snowflake_schema.test_schema.name
-	depends_on = [snowflake_function.test_funct_simple, snowflake_function.test_funct]
+	handler := fmt.Sprintf("%s.%s", className, funcName)
+	definition := acc.TestClient().Function.SampleJavaDefinition(t, className, funcName, argName)
+
+	id1 := acc.TestClient().Ids.RandomSchemaObjectIdentifierWithArgumentsNewDataTypes(dataType)
+	id2 := acc.TestClient().Ids.RandomSchemaObjectIdentifierWithArgumentsNewDataTypes(dataType)
+
+	functionsSetup := config.FromModels(t,
+		model.FunctionJavaBasicInline("f1", id1, dataType, handler, definition).WithArgument(argName, dataType),
+		model.FunctionJavaBasicInline("f2", id2, dataType, handler, definition).WithArgument(argName, dataType),
+	)
+
+	return fmt.Sprintf(`
+%s
+data "snowflake_functions" "functions" {
+  database   = "%s"
+  schema     = "%s"
+  depends_on = [snowflake_function_java.f1, snowflake_function_java.f2]
 }
-`
-	return fmt.Sprintf(s, databaseName, schemaName, functionName, functionWithArgumentsName)
+`, functionsSetup, acc.TestDatabaseName, acc.TestSchemaName)
 }

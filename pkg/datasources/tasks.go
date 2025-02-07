@@ -1,52 +1,55 @@
 package datasources
 
 import (
-	"database/sql"
-	"fmt"
-	"log"
+	"context"
 
-	"github.com/chanzuckerberg/terraform-provider-snowflake/pkg/snowflake"
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/provider/datasources"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
+
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/internal/provider"
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/resources"
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/schemas"
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/sdk"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 )
 
 var tasksSchema = map[string]*schema.Schema{
-	"database": {
-		Type:        schema.TypeString,
-		Required:    true,
-		Description: "The database from which to return the schemas from.",
+	"with_parameters": {
+		Type:        schema.TypeBool,
+		Optional:    true,
+		Default:     true,
+		Description: "Runs SHOW PARAMETERS FOR TASK for each task returned by SHOW TASK and saves the output to the parameters field as a map. By default this value is set to true.",
 	},
-	"schema": {
-		Type:        schema.TypeString,
-		Required:    true,
-		Description: "The schema from which to return the tasks from.",
+	"like":        likeSchema,
+	"in":          extendedInSchema,
+	"starts_with": startsWithSchema,
+	"root_only": {
+		Type:        schema.TypeBool,
+		Optional:    true,
+		Description: "Filters the command output to return only root tasks (tasks with no predecessors).",
 	},
+	"limit": limitFromSchema,
 	"tasks": {
 		Type:        schema.TypeList,
 		Computed:    true,
-		Description: "The tasks in the schema",
+		Description: "Holds the aggregated output of all task details queries.",
 		Elem: &schema.Resource{
 			Schema: map[string]*schema.Schema{
-				"name": {
-					Type:     schema.TypeString,
-					Computed: true,
+				resources.ShowOutputAttributeName: {
+					Type:        schema.TypeList,
+					Computed:    true,
+					Description: "Holds the output of SHOW TASKS.",
+					Elem: &schema.Resource{
+						Schema: schemas.ShowTaskSchema,
+					},
 				},
-				"database": {
-					Type:     schema.TypeString,
-					Computed: true,
-				},
-				"schema": {
-					Type:     schema.TypeString,
-					Computed: true,
-				},
-				"comment": {
-					Type:     schema.TypeString,
-					Optional: true,
-					Computed: true,
-				},
-				"warehouse": {
-					Type:     schema.TypeString,
-					Optional: true,
-					Computed: true,
+				resources.ParametersAttributeName: {
+					Type:        schema.TypeList,
+					Computed:    true,
+					Description: "Holds the output of SHOW PARAMETERS FOR TASK.",
+					Elem: &schema.Resource{
+						Schema: schemas.ShowTaskParametersSchema,
+					},
 				},
 			},
 		},
@@ -55,42 +58,54 @@ var tasksSchema = map[string]*schema.Schema{
 
 func Tasks() *schema.Resource {
 	return &schema.Resource{
-		Read:   ReadTasks,
-		Schema: tasksSchema,
+		ReadContext: TrackingReadWrapper(datasources.Tasks, ReadTasks),
+		Schema:      tasksSchema,
+		Description: "Data source used to get details of filtered tasks. Filtering is aligned with the current possibilities for [SHOW TASKS](https://docs.snowflake.com/en/sql-reference/sql/show-tasks) query. The results of SHOW and SHOW PARAMETERS IN are encapsulated in one output collection `tasks`.",
 	}
 }
 
-func ReadTasks(d *schema.ResourceData, meta interface{}) error {
-	db := meta.(*sql.DB)
-	databaseName := d.Get("database").(string)
-	schemaName := d.Get("schema").(string)
+func ReadTasks(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	client := meta.(*provider.Context).Client
+	req := sdk.NewShowTaskRequest()
 
-	currentTasks, err := snowflake.ListTasks(databaseName, schemaName, db)
-	if err == sql.ErrNoRows {
-		// If not found, mark resource to be removed from statefile during apply or refresh
-		log.Printf("[DEBUG] tasks in schema (%s) not found", d.Id())
-		d.SetId("")
-		return nil
-	} else if err != nil {
-		log.Printf("[DEBUG] unable to parse tasks in schema (%s)", d.Id())
-		d.SetId("")
-		return nil
+	handleLike(d, &req.Like)
+	if err := handleExtendedIn(d, &req.In); err != nil {
+		return diag.FromErr(err)
+	}
+	handleStartsWith(d, &req.StartsWith)
+	if v, ok := d.GetOk("root_only"); ok && v.(bool) {
+		req.WithRootOnly(true)
+	}
+	handleLimitFrom(d, &req.Limit)
+
+	tasks, err := client.Tasks.Show(ctx, req)
+	if err != nil {
+		return diag.FromErr(err)
+	}
+	d.SetId("tasks_read")
+
+	flattenedTasks := make([]map[string]any, len(tasks))
+	for i, task := range tasks {
+		task := task
+
+		var taskParameters []map[string]any
+		if d.Get("with_parameters").(bool) {
+			parameters, err := client.Tasks.ShowParameters(ctx, task.ID())
+			if err != nil {
+				return diag.FromErr(err)
+			}
+			taskParameters = []map[string]any{schemas.TaskParametersToSchema(parameters)}
+		}
+
+		flattenedTasks[i] = map[string]any{
+			resources.ShowOutputAttributeName: []map[string]any{schemas.TaskToSchema(&task)},
+			resources.ParametersAttributeName: taskParameters,
+		}
 	}
 
-	tasks := []map[string]interface{}{}
-
-	for _, task := range currentTasks {
-		taskMap := map[string]interface{}{}
-
-		taskMap["name"] = task.Name
-		taskMap["database"] = task.DatabaseName
-		taskMap["schema"] = task.SchemaName
-		taskMap["comment"] = task.Comment
-		taskMap["warehouse"] = task.Warehouse
-
-		tasks = append(tasks, taskMap)
+	if err := d.Set("tasks", flattenedTasks); err != nil {
+		return diag.FromErr(err)
 	}
 
-	d.SetId(fmt.Sprintf(`%v|%v`, databaseName, schemaName))
-	return d.Set("tasks", tasks)
+	return nil
 }

@@ -3,12 +3,20 @@ package datasources_test
 import (
 	"testing"
 
-	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/resource"
+	acc "github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/acceptance"
+
+	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
+	"github.com/hashicorp/terraform-plugin-testing/tfversion"
 )
 
-func TestAccSystemGetPrivateLinkConfig_aws(t *testing.T) {
-	resource.ParallelTest(t, resource.TestCase{
-		Providers: providers(),
+func TestAcc_SystemGetPrivateLinkConfig_aws(t *testing.T) {
+	resource.Test(t, resource.TestCase{
+		ProtoV6ProviderFactories: acc.TestAccProtoV6ProviderFactories,
+		PreCheck:                 func() { acc.TestAccPreCheck(t) },
+		TerraformVersionChecks: []tfversion.TerraformVersionCheck{
+			tfversion.RequireAbove(tfversion.Version1_5_0),
+		},
+		CheckDestroy: nil,
 		Steps: []resource.TestStep{
 			{
 				Config: privateLinkConfig(),
@@ -17,6 +25,9 @@ func TestAccSystemGetPrivateLinkConfig_aws(t *testing.T) {
 					resource.TestCheckResourceAttrSet("data.snowflake_system_get_privatelink_config.p", "account_url"),
 					resource.TestCheckResourceAttrSet("data.snowflake_system_get_privatelink_config.p", "ocsp_url"),
 					resource.TestCheckResourceAttrSet("data.snowflake_system_get_privatelink_config.p", "aws_vpce_id"),
+					resource.TestCheckResourceAttrSet("data.snowflake_system_get_privatelink_config.p", "regionless_account_url"),
+					resource.TestCheckResourceAttrSet("data.snowflake_system_get_privatelink_config.p", "regionless_snowsight_url"),
+					resource.TestCheckResourceAttrSet("data.snowflake_system_get_privatelink_config.p", "snowsight_url"),
 				),
 			},
 		},

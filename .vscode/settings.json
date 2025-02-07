@@ -1,0 +1,17 @@
+{
+    "files.insertFinalNewline": true,
+    "go.testEnvFile": "${workspaceFolder}/test.env",
+    "go.formatTool": "gofumpt",
+    "gopls": {
+        "formatting.gofumpt": true
+    },
+    "go.testFlags": [
+        "-v"
+    ],
+    "go.testTimeout": "600s",
+    "go.lintTool": "golangci-lint",
+    "go.lintFlags": [
+        "--fast"
+    ],
+    "files.trimTrailingWhitespace": true,
+}

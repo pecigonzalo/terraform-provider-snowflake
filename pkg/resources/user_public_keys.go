@@ -1,13 +1,21 @@
 package resources
 
 import (
+	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
 
-	"github.com/chanzuckerberg/go-misc/sets"
-	"github.com/chanzuckerberg/terraform-provider-snowflake/pkg/snowflake"
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/provider/previewfeatures"
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/provider/resources"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
+
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/helpers"
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/internal/provider"
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/sdk"
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/snowflake"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 )
 
@@ -16,7 +24,7 @@ var userPublicKeyProperties = []string{
 	"rsa_public_key_2",
 }
 
-// sanitize input to supress diffs, etc
+// sanitize input to suppress diffs, etc.
 func publicKeyStateFunc(v interface{}) string {
 	value := v.(string)
 	value = strings.TrimSuffix(value, "\n")
@@ -47,10 +55,10 @@ var userPublicKeysSchema = map[string]*schema.Schema{
 
 func UserPublicKeys() *schema.Resource {
 	return &schema.Resource{
-		Create: CreateUserPublicKeys,
-		Read:   ReadUserPublicKeys,
-		Update: UpdateUserPublicKeys,
-		Delete: DeleteUserPublicKeys,
+		CreateContext: PreviewFeatureCreateContextWrapper(string(previewfeatures.UserPublicKeysResource), TrackingCreateWrapper(resources.UserPublicKeys, CreateUserPublicKeys)),
+		ReadContext:   PreviewFeatureReadContextWrapper(string(previewfeatures.UserPublicKeysResource), TrackingReadWrapper(resources.UserPublicKeys, ReadUserPublicKeys)),
+		UpdateContext: PreviewFeatureUpdateContextWrapper(string(previewfeatures.UserPublicKeysResource), TrackingUpdateWrapper(resources.UserPublicKeys, UpdateUserPublicKeys)),
+		DeleteContext: PreviewFeatureDeleteContextWrapper(string(previewfeatures.UserPublicKeysResource), TrackingDeleteWrapper(resources.UserPublicKeys, DeleteUserPublicKeys)),
 
 		Schema: userPublicKeysSchema,
 		Importer: &schema.ResourceImporter{
@@ -59,12 +67,11 @@ func UserPublicKeys() *schema.Resource {
 	}
 }
 
-func checkUserExists(db *sql.DB, name string) (bool, error) {
+func checkUserExists(ctx context.Context, client *sdk.Client, userId sdk.AccountObjectIdentifier) (bool, error) {
 	// First check if user exists
-	stmt := snowflake.User(name).Describe()
-	_, err := snowflake.Query(db, stmt)
-	if err == sql.ErrNoRows {
-		log.Printf("[DEBUG] user (%s) not found", name)
+	_, err := client.Users.Describe(ctx, userId)
+	if errors.Is(err, sdk.ErrObjectNotExistOrAuthorized) {
+		log.Printf("[DEBUG] user (%s) not found", userId.Name())
 		return false, nil
 	}
 	if err != nil {
@@ -74,15 +81,15 @@ func checkUserExists(db *sql.DB, name string) (bool, error) {
 	return true, nil
 }
 
-func ReadUserPublicKeys(d *schema.ResourceData, meta interface{}) error {
-	db := meta.(*sql.DB)
-	id := d.Id()
+func ReadUserPublicKeys(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	client := meta.(*provider.Context).Client
+	id := helpers.DecodeSnowflakeID(d.Id()).(sdk.AccountObjectIdentifier)
 
-	exists, err := checkUserExists(db, id)
+	exists, err := checkUserExists(ctx, client, id)
 	if err != nil {
-		return err
+		return diag.FromErr(err)
 	}
-	// If not found, mark resource to be removed from statefile during apply or refresh
+	// If not found, mark resource to be removed from state file during apply or refresh
 	if !exists {
 		d.SetId("")
 		return nil
@@ -91,8 +98,9 @@ func ReadUserPublicKeys(d *schema.ResourceData, meta interface{}) error {
 	return nil
 }
 
-func CreateUserPublicKeys(d *schema.ResourceData, meta interface{}) error {
-	db := meta.(*sql.DB)
+func CreateUserPublicKeys(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	client := meta.(*provider.Context).Client
+	db := client.GetConn().DB
 	name := d.Get("name").(string)
 
 	for _, prop := range userPublicKeyProperties {
@@ -102,20 +110,21 @@ func CreateUserPublicKeys(d *schema.ResourceData, meta interface{}) error {
 		}
 		err := updateUserPublicKeys(db, name, prop, publicKey.(string))
 		if err != nil {
-			return err
+			return diag.FromErr(err)
 		}
 	}
 
 	d.SetId(name)
-	return ReadUserPublicKeys(d, meta)
+	return ReadUserPublicKeys(ctx, d, meta)
 }
 
-func UpdateUserPublicKeys(d *schema.ResourceData, meta interface{}) error {
-	db := meta.(*sql.DB)
+func UpdateUserPublicKeys(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	client := meta.(*provider.Context).Client
+	db := client.GetConn().DB
 	name := d.Id()
 
 	propsToSet := map[string]string{}
-	propsToUnset := sets.NewStringSet()
+	propsToUnset := map[string]string{}
 
 	for _, prop := range userPublicKeyProperties {
 		// if key hasn't changed, continue
@@ -127,7 +136,7 @@ func UpdateUserPublicKeys(d *schema.ResourceData, meta interface{}) error {
 		if publicKeyOK { // if set, then we should update the value
 			propsToSet[prop] = publicKey.(string)
 		} else { // if now unset, we should unset the key from the user
-			propsToUnset.Add(publicKey.(string))
+			propsToUnset[prop] = publicKey.(string)
 		}
 	}
 
@@ -135,29 +144,30 @@ func UpdateUserPublicKeys(d *schema.ResourceData, meta interface{}) error {
 	for prop, value := range propsToSet {
 		err := updateUserPublicKeys(db, name, prop, value)
 		if err != nil {
-			return err
+			return diag.FromErr(err)
 		}
 	}
 
 	// unset the keys we decided should be unset
-	for _, prop := range propsToUnset.List() {
-		err := unsetUserPublicKeys(db, name, prop)
+	for k := range propsToUnset {
+		err := unsetUserPublicKeys(db, name, k)
 		if err != nil {
-			return err
+			return diag.FromErr(err)
 		}
 	}
 	// re-sync
-	return ReadUserPublicKeys(d, meta)
+	return ReadUserPublicKeys(ctx, d, meta)
 }
 
-func DeleteUserPublicKeys(d *schema.ResourceData, meta interface{}) error {
-	db := meta.(*sql.DB)
+func DeleteUserPublicKeys(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	client := meta.(*provider.Context).Client
+	db := client.GetConn().DB
 	name := d.Id()
 
 	for _, prop := range userPublicKeyProperties {
 		err := unsetUserPublicKeys(db, name, prop)
 		if err != nil {
-			return err
+			return diag.FromErr(err)
 		}
 	}
 
@@ -169,6 +179,7 @@ func updateUserPublicKeys(db *sql.DB, name string, prop string, value string) er
 	stmt := fmt.Sprintf(`ALTER USER "%s" SET %s = '%s'`, name, prop, value)
 	return snowflake.Exec(db, stmt)
 }
+
 func unsetUserPublicKeys(db *sql.DB, name string, prop string) error {
 	stmt := fmt.Sprintf(`ALTER USER "%s" UNSET %s`, name, prop)
 	return snowflake.Exec(db, stmt)

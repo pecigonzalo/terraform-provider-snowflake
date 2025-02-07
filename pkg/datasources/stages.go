@@ -1,11 +1,17 @@
 package datasources
 
 import (
-	"database/sql"
+	"context"
 	"fmt"
-	"log"
 
-	"github.com/chanzuckerberg/terraform-provider-snowflake/pkg/snowflake"
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/provider/datasources"
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/provider/previewfeatures"
+
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/internal/provider"
+
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/helpers"
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/sdk"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 )
 
@@ -55,42 +61,55 @@ var stagesSchema = map[string]*schema.Schema{
 
 func Stages() *schema.Resource {
 	return &schema.Resource{
-		Read:   ReadStages,
-		Schema: stagesSchema,
+		ReadContext: PreviewFeatureReadWrapper(string(previewfeatures.StagesDatasource), TrackingReadWrapper(datasources.Stages, ReadStages)),
+		Schema:      stagesSchema,
 	}
 }
 
-func ReadStages(d *schema.ResourceData, meta interface{}) error {
-	db := meta.(*sql.DB)
+func ReadStages(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	client := meta.(*provider.Context).Client
+
 	databaseName := d.Get("database").(string)
 	schemaName := d.Get("schema").(string)
 
-	currentStages, err := snowflake.ListStages(databaseName, schemaName, db)
-	if err == sql.ErrNoRows {
-		// If not found, mark resource to be removed from statefile during apply or refresh
-		log.Printf("[DEBUG] stages in schema (%s) not found", d.Id())
+	stages, err := client.Stages.Show(ctx, sdk.NewShowStageRequest().WithIn(
+		sdk.In{
+			Schema: sdk.NewDatabaseObjectIdentifier(databaseName, schemaName),
+		},
+	))
+	if err != nil {
 		d.SetId("")
-		return nil
-	} else if err != nil {
-		log.Printf("[DEBUG] unable to parse stages in schema (%s)", d.Id())
-		d.SetId("")
-		return nil
+		return diag.Diagnostics{
+			diag.Diagnostic{
+				Severity: diag.Warning,
+				Summary:  "Failed to query stages",
+				Detail:   fmt.Sprintf("DatabaseName: %s, SchemaName: %s, Err: %s", databaseName, schemaName, err),
+			},
+		}
 	}
 
-	stages := []map[string]interface{}{}
-
-	for _, stage := range currentStages {
-		stageMap := map[string]interface{}{}
-
-		stageMap["name"] = stage.Name
-		stageMap["database"] = stage.DatabaseName
-		stageMap["schema"] = stage.SchemaName
-		stageMap["comment"] = stage.Comment
-		stageMap["storage_integration"] = stage.StorageIntegration
-
-		stages = append(stages, stageMap)
+	stagesList := make([]map[string]any, len(stages))
+	for i, stage := range stages {
+		stagesList[i] = map[string]any{
+			"name":                stage.Name,
+			"database":            stage.DatabaseName,
+			"schema":              stage.SchemaName,
+			"comment":             stage.Comment,
+			"storage_integration": stage.StorageIntegration,
+		}
 	}
 
-	d.SetId(fmt.Sprintf(`%v|%v`, databaseName, schemaName))
-	return d.Set("stages", stages)
+	if err := d.Set("stages", stagesList); err != nil {
+		return diag.Diagnostics{
+			diag.Diagnostic{
+				Severity: diag.Error,
+				Summary:  "Failed to set stages",
+				Detail:   fmt.Sprintf("Err: %s", err),
+			},
+		}
+	}
+
+	d.SetId(helpers.EncodeSnowflakeID(databaseName, schemaName))
+
+	return nil
 }

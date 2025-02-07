@@ -2,117 +2,101 @@ package resources_test
 
 import (
 	"fmt"
-	"strings"
 	"testing"
 
-	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/acctest"
-	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/resource"
+	acc "github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/acceptance"
+
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/provider/resources"
+	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
+	"github.com/hashicorp/terraform-plugin-testing/tfversion"
 )
 
 func TestAcc_Sequence(t *testing.T) {
-	accName := strings.ToUpper(acctest.RandStringFromCharSet(10, acctest.CharSetAlpha))
-	accRename := strings.ToUpper(acctest.RandStringFromCharSet(10, acctest.CharSetAlpha))
+	oldId := acc.TestClient().Ids.RandomSchemaObjectIdentifier()
+	newId := acc.TestClient().Ids.RandomSchemaObjectIdentifier()
 
-	resource.ParallelTest(t, resource.TestCase{
-		Providers: providers(),
+	resource.Test(t, resource.TestCase{
+		ProtoV6ProviderFactories: acc.TestAccProtoV6ProviderFactories,
+		TerraformVersionChecks: []tfversion.TerraformVersionCheck{
+			tfversion.RequireAbove(tfversion.Version1_5_0),
+		},
+		PreCheck:     func() { acc.TestAccPreCheck(t) },
+		CheckDestroy: acc.CheckDestroy(t, resources.Sequence),
 		Steps: []resource.TestStep{
 			// CREATE
 			{
-				Config: sequenceConfig(accName, accName),
+				Config: sequenceConfig(oldId.Name(), acc.TestDatabaseName, acc.TestSchemaName),
 				Check: resource.ComposeTestCheckFunc(
-					resource.TestCheckResourceAttr("snowflake_sequence.test_sequence", "name", accName),
+					resource.TestCheckResourceAttr("snowflake_sequence.test_sequence", "name", oldId.Name()),
 					resource.TestCheckResourceAttr("snowflake_sequence.test_sequence", "next_value", "1"),
-					resource.TestCheckResourceAttr("snowflake_sequence.test_sequence", "fully_qualified_name", fmt.Sprintf(`%v.%v.%v`, accName, accName, accName)),
+					resource.TestCheckResourceAttr("snowflake_sequence.test_sequence", "fully_qualified_name", oldId.FullyQualifiedName()),
+					resource.TestCheckResourceAttr("snowflake_sequence.test_sequence", "ordering", "ORDER"),
 				),
 			},
 			// Set comment and rename
 			{
-				Config: sequenceConfigWithComment(accName, accRename, "look at me I am a comment"),
+				Config: sequenceConfigWithComment(newId.Name(), "look at me I am a comment", acc.TestDatabaseName, acc.TestSchemaName),
 				Check: resource.ComposeTestCheckFunc(
-					resource.TestCheckResourceAttr("snowflake_sequence.test_sequence", "name", accRename),
+					resource.TestCheckResourceAttr("snowflake_sequence.test_sequence", "name", newId.Name()),
 					resource.TestCheckResourceAttr("snowflake_sequence.test_sequence", "comment", "look at me I am a comment"),
 					resource.TestCheckResourceAttr("snowflake_sequence.test_sequence", "next_value", "1"),
-					resource.TestCheckResourceAttr("snowflake_sequence.test_sequence", "fully_qualified_name", fmt.Sprintf(`%v.%v.%v`, accName, accName, accRename)),
+					resource.TestCheckResourceAttr("snowflake_sequence.test_sequence", "fully_qualified_name", newId.FullyQualifiedName()),
 				),
 			},
 			// Unset comment and set increment
 			{
-				Config: sequenceConfigWithIncrement(accName, accName),
+				Config: sequenceConfigWithIncrement(oldId.Name(), acc.TestDatabaseName, acc.TestSchemaName),
 				Check: resource.ComposeTestCheckFunc(
-					resource.TestCheckResourceAttr("snowflake_sequence.test_sequence", "name", accName),
+					resource.TestCheckResourceAttr("snowflake_sequence.test_sequence", "name", oldId.Name()),
 					resource.TestCheckResourceAttr("snowflake_sequence.test_sequence", "comment", ""),
 					resource.TestCheckResourceAttr("snowflake_sequence.test_sequence", "next_value", "1"),
 					resource.TestCheckResourceAttr("snowflake_sequence.test_sequence", "increment", "32"),
-					resource.TestCheckResourceAttr("snowflake_sequence.test_sequence", "fully_qualified_name", fmt.Sprintf(`%v.%v.%v`, accName, accName, accName)),
+					resource.TestCheckResourceAttr("snowflake_sequence.test_sequence", "ordering", "NOORDER"),
+					resource.TestCheckResourceAttr("snowflake_sequence.test_sequence", "fully_qualified_name", oldId.FullyQualifiedName()),
 				),
+			},
+			// IMPORT
+			{
+				ResourceName:      "snowflake_sequence.test_sequence",
+				ImportState:       true,
+				ImportStateVerify: true,
 			},
 		},
 	})
 }
 
-func sequenceConfigWithIncrement(name, sequenceName string) string {
+func sequenceConfigWithIncrement(sequenceName string, databaseName string, schemaName string) string {
 	s := `
-resource "snowflake_database" "test_database" {
-	name    = "%s"
-	comment = "Terraform acceptance test"
-}
-
-resource "snowflake_schema" "test_schema" {
-	name     = "%s"
-	database = snowflake_database.test_database.name
-	comment  = "Terraform acceptance test"
-}
-
 resource "snowflake_sequence" "test_sequence" {
-	database   = snowflake_database.test_database.name
-	schema     = snowflake_schema.test_schema.name
 	name       = "%s"
-  increment = 32
+	database   = "%s"
+	schema     = "%s"
+    increment = 32
+	ordering = "NOORDER"
 }
 `
-	return fmt.Sprintf(s, name, name, sequenceName)
+	return fmt.Sprintf(s, sequenceName, databaseName, schemaName)
 }
-func sequenceConfig(name, sequenceName string) string {
+
+func sequenceConfig(sequenceName string, databaseName string, schemaName string) string {
 	s := `
-resource "snowflake_database" "test_database" {
-	name    = "%s"
-	comment = "Terraform acceptance test"
-}
-
-resource "snowflake_schema" "test_schema" {
-	name     = "%s"
-	database = snowflake_database.test_database.name
-	comment  = "Terraform acceptance test"
-}
-
 resource "snowflake_sequence" "test_sequence" {
-	database = snowflake_database.test_database.name
-	schema   = snowflake_schema.test_schema.name
 	name     = "%s"
+	database   = "%s"
+	schema     = "%s"
 }
 `
-	return fmt.Sprintf(s, name, name, sequenceName)
+	return fmt.Sprintf(s, sequenceName, databaseName, schemaName)
 }
 
-func sequenceConfigWithComment(name, sequenceName, comment string) string {
+func sequenceConfigWithComment(sequenceName, comment string, databaseName string, schemaName string) string {
 	s := `
-resource "snowflake_database" "test_database" {
-	name    = "%s"
-	comment = "Terraform acceptance test"
-}
-
-resource "snowflake_schema" "test_schema" {
-	name     = "%s"
-	database = snowflake_database.test_database.name
-	comment  = "Terraform acceptance test"
-}
-
 resource "snowflake_sequence" "test_sequence" {
-	database = snowflake_database.test_database.name
-	schema   = snowflake_schema.test_schema.name
 	name     = "%s"
-  comment  = "%s"
+	database   = "%s"
+	schema     = "%s"
+    comment  = "%s"
 }
 `
-	return fmt.Sprintf(s, name, name, sequenceName, comment)
+	return fmt.Sprintf(s, sequenceName, databaseName, schemaName, comment)
 }

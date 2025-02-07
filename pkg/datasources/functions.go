@@ -1,11 +1,17 @@
 package datasources
 
 import (
-	"database/sql"
+	"context"
 	"fmt"
-	"log"
 
-	"github.com/chanzuckerberg/terraform-provider-snowflake/pkg/snowflake"
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/provider/datasources"
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/provider/previewfeatures"
+
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/internal/provider"
+
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/helpers"
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/sdk"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 )
 
@@ -61,48 +67,52 @@ var functionsSchema = map[string]*schema.Schema{
 
 func Functions() *schema.Resource {
 	return &schema.Resource{
-		Read:   ReadFunctions,
-		Schema: functionsSchema,
+		ReadContext: PreviewFeatureReadWrapper(string(previewfeatures.FunctionsDatasource), TrackingReadWrapper(datasources.Functions, ReadContextFunctions)),
+		Schema:      functionsSchema,
 	}
 }
 
-func ReadFunctions(d *schema.ResourceData, meta interface{}) error {
-	db := meta.(*sql.DB)
+func ReadContextFunctions(ctx context.Context, d *schema.ResourceData, meta interface{}) diag.Diagnostics {
+	client := meta.(*provider.Context).Client
 	databaseName := d.Get("database").(string)
 	schemaName := d.Get("schema").(string)
 
-	currentFunctions, err := snowflake.ListFunctions(databaseName, schemaName, db)
-	if err == sql.ErrNoRows {
-		// If not found, mark resource to be removed from statefile during apply or refresh
-		log.Printf("[DEBUG] functions in schema (%s) not found", d.Id())
+	request := sdk.NewShowFunctionRequest()
+	request.WithIn(sdk.ExtendedIn{In: sdk.In{Schema: sdk.NewDatabaseObjectIdentifier(databaseName, schemaName)}})
+	functions, err := client.Functions.Show(ctx, request)
+	if err != nil {
+		id := d.Id()
+
 		d.SetId("")
-		return nil
-	} else if err != nil {
-		log.Printf("[DEBUG] unable to parse functions in schema (%s)", d.Id())
-		d.SetId("")
-		return nil
-	}
-
-	functions := []map[string]interface{}{}
-
-	for _, function := range currentFunctions {
-		functionMap := map[string]interface{}{}
-
-		functionSignatureMap, err := parseArguments(function.Arguments.String)
-		if err != nil {
-			return err
+		return diag.Diagnostics{
+			diag.Diagnostic{
+				Severity: diag.Warning,
+				Summary:  fmt.Sprintf("Unable to parse functions in schema (%s)", id),
+				Detail:   "See our document on design decisions for functions: <LINK (coming soon)>",
+			},
 		}
-
-		functionMap["name"] = function.Name.String
-		functionMap["database"] = function.DatabaseName.String
-		functionMap["schema"] = function.SchemaName.String
-		functionMap["comment"] = function.Comment.String
-		functionMap["argument_types"] = functionSignatureMap["argumentTypes"].([]string)
-		functionMap["return_type"] = functionSignatureMap["returnType"].(string)
-
-		functions = append(functions, functionMap)
 	}
 
-	d.SetId(fmt.Sprintf(`%v|%v`, databaseName, schemaName))
-	return d.Set("functions", functions)
+	entities := []map[string]interface{}{}
+	for _, item := range functions {
+		// TODO(SNOW-1596962): Create argument parsing function that takes argument names into consideration.
+		signature, err := parseArguments(item.ArgumentsRaw)
+		if err != nil {
+			return diag.FromErr(err)
+		}
+		m := map[string]interface{}{}
+		m["name"] = item.Name
+		m["database"] = databaseName
+		m["schema"] = schemaName
+		m["comment"] = item.Description
+		m["argument_types"] = signature["argumentTypes"].([]string)
+		m["return_type"] = signature["returnType"].(string)
+
+		entities = append(entities, m)
+	}
+	d.SetId(helpers.EncodeSnowflakeID(databaseName, schemaName))
+	if err := d.Set("functions", entities); err != nil {
+		return diag.FromErr(err)
+	}
+	return nil
 }

@@ -1,151 +1,348 @@
-package resources_test
+package resources
 
 import (
-	"database/sql"
 	"fmt"
+	"reflect"
 	"testing"
 
-	sqlmock "github.com/DATA-DOG/go-sqlmock"
-	"github.com/chanzuckerberg/terraform-provider-snowflake/pkg/provider"
-	"github.com/chanzuckerberg/terraform-provider-snowflake/pkg/resources"
-	"github.com/chanzuckerberg/terraform-provider-snowflake/pkg/snowflake"
-	"github.com/chanzuckerberg/terraform-provider-snowflake/pkg/testhelpers"
-	. "github.com/chanzuckerberg/terraform-provider-snowflake/pkg/testhelpers"
-	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
-	"github.com/stretchr/testify/require"
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/sdk"
+	"github.com/stretchr/testify/assert"
 )
 
-func TestView(t *testing.T) {
-	r := require.New(t)
-	err := resources.View().InternalValidate(provider.Provider().Schema, true)
-	r.NoError(err)
+type testResourceValueSetter struct {
+	internalMap map[string]any
 }
 
-func TestViewCreate(t *testing.T) {
-	r := require.New(t)
-
-	in := map[string]interface{}{
-		"name":      "good_name",
-		"database":  "test_db",
-		"schema":    "test_schema",
-		"comment":   "great comment",
-		"statement": "SELECT * FROM test_db.PUBLIC.GREAT_TABLE WHERE account_id = 'bobs-account-id'",
-		"is_secure": true,
+func newTestResourceValueSetter() *testResourceValueSetter {
+	return &testResourceValueSetter{
+		internalMap: make(map[string]any),
 	}
-	d := schema.TestResourceDataRaw(t, resources.View().Schema, in)
-	r.NotNil(d)
-
-	WithMockDb(t, func(db *sql.DB, mock sqlmock.Sqlmock) {
-		mock.ExpectExec(
-			`^CREATE SECURE VIEW "test_db"."test_schema"."good_name" COMMENT = 'great comment' AS SELECT \* FROM test_db.PUBLIC.GREAT_TABLE WHERE account_id = 'bobs-account-id'$`,
-		).WillReturnResult(sqlmock.NewResult(1, 1))
-
-		expectReadView(mock)
-		err := resources.CreateView(d, db)
-		r.NoError(err)
-	})
-}
-func TestViewCreateOrReplace(t *testing.T) {
-	r := require.New(t)
-
-	in := map[string]interface{}{
-		"name":       "good_name",
-		"database":   "test_db",
-		"schema":     "test_schema",
-		"comment":    "great comment",
-		"statement":  "SELECT * FROM test_db.PUBLIC.GREAT_TABLE WHERE account_id = 'bobs-account-id'",
-		"is_secure":  true,
-		"or_replace": true,
-	}
-	d := schema.TestResourceDataRaw(t, resources.View().Schema, in)
-	r.NotNil(d)
-
-	WithMockDb(t, func(db *sql.DB, mock sqlmock.Sqlmock) {
-		mock.ExpectExec(
-			`^CREATE OR REPLACE SECURE VIEW "test_db"."test_schema"."good_name" COMMENT = 'great comment' AS SELECT \* FROM test_db.PUBLIC.GREAT_TABLE WHERE account_id = 'bobs-account-id'$`,
-		).WillReturnResult(sqlmock.NewResult(1, 1))
-
-		expectReadView(mock)
-		err := resources.CreateView(d, db)
-		r.NoError(err)
-	})
-}
-func TestViewCreateAmpersand(t *testing.T) {
-	r := require.New(t)
-
-	in := map[string]interface{}{
-		"name":      "good_name",
-		"database":  "test_db",
-		"schema":    "test_schema",
-		"comment":   "great comment",
-		"statement": "SELECT * FROM test_db.PUBLIC.GREAT_TABLE WHERE account_id LIKE 'bob%'",
-		"is_secure": true,
-	}
-	d := schema.TestResourceDataRaw(t, resources.View().Schema, in)
-	r.NotNil(d)
-
-	WithMockDb(t, func(db *sql.DB, mock sqlmock.Sqlmock) {
-		mock.ExpectExec(
-			`^CREATE SECURE VIEW "test_db"."test_schema"."good_name" COMMENT = 'great comment' AS SELECT \* FROM test_db.PUBLIC.GREAT_TABLE WHERE account_id LIKE 'bob%'$`,
-		).WillReturnResult(sqlmock.NewResult(1, 1))
-
-		expectReadView(mock)
-		err := resources.CreateView(d, db)
-		r.NoError(err)
-	})
 }
 
-func expectReadView(mock sqlmock.Sqlmock) {
-	rows := sqlmock.NewRows([]string{
-		"created_on", "name", "reserved", "database_name", "schema_name", "owner", "comment", "text", "is_secure", "is_materialized"},
-	).AddRow("2019-05-19 16:55:36.530 -0700", "good_name", "", "test_db", "test_schema", "admin", "great comment", "SELECT * FROM test_db.GREAT_SCHEMA.GREAT_TABLE WHERE account_id = 'bobs-account-id'", true, false)
-	mock.ExpectQuery(`^SHOW VIEWS LIKE 'good_name' IN SCHEMA "test_db"."test_schema"$`).WillReturnRows(rows)
+func (s *testResourceValueSetter) Set(key string, value any) error {
+	s.internalMap[key] = value
+	return nil
 }
 
-func TestDiffSuppressStatement(t *testing.T) {
-	type args struct {
-		k   string
-		old string
-		new string
-		d   *schema.ResourceData
-	}
-	tests := []struct {
-		name string
-		args args
-		want bool
+func Test_handleColumns(t *testing.T) {
+	testCases := []struct {
+		InputColumns          []sdk.ViewDetails
+		InputPolicyReferences []sdk.PolicyReference
+		Expected              map[string]any
 	}{
-		{"select", args{"", "select * from foo;", "select * from foo;", nil}, true},
-		{"view 1", args{"", testhelpers.MustFixture(t, "view_1a.sql"), testhelpers.MustFixture(t, "view_1b.sql"), nil}, true},
-		{"view 2", args{"", testhelpers.MustFixture(t, "view_2a.sql"), testhelpers.MustFixture(t, "view_2b.sql"), nil}, true},
+		{
+			InputColumns:          []sdk.ViewDetails{},
+			InputPolicyReferences: []sdk.PolicyReference{},
+			Expected: map[string]any{
+				"column": nil,
+			},
+		},
+		{
+			InputColumns: []sdk.ViewDetails{
+				{
+					Name:    "name",
+					Comment: nil,
+				},
+			},
+			InputPolicyReferences: []sdk.PolicyReference{},
+			Expected: map[string]any{
+				"column": []map[string]any{
+					{
+						"column_name": "name",
+						"comment":     nil,
+					},
+				},
+			},
+		},
+		{
+			InputColumns: []sdk.ViewDetails{
+				{
+					Name:    "name",
+					Comment: sdk.String("comment"),
+				},
+			},
+			InputPolicyReferences: []sdk.PolicyReference{},
+			Expected: map[string]any{
+				"column": []map[string]any{
+					{
+						"column_name": "name",
+						"comment":     "comment",
+					},
+				},
+			},
+		},
+		{
+			InputColumns: []sdk.ViewDetails{
+				{
+					Name:    "name",
+					Comment: sdk.String("comment"),
+				},
+				{
+					Name:    "name2",
+					Comment: sdk.String("comment2"),
+				},
+			},
+			InputPolicyReferences: []sdk.PolicyReference{},
+			Expected: map[string]any{
+				"column": []map[string]any{
+					{
+						"column_name": "name",
+						"comment":     "comment",
+					},
+					{
+						"column_name": "name2",
+						"comment":     "comment2",
+					},
+				},
+			},
+		},
+		{
+			InputColumns: []sdk.ViewDetails{
+				{
+					Name:    "name",
+					Comment: sdk.String("comment"),
+				},
+				{
+					Name:    "name2",
+					Comment: sdk.String("comment2"),
+				},
+			},
+			InputPolicyReferences: []sdk.PolicyReference{
+				{
+					PolicyDb:      sdk.String("db"),
+					PolicySchema:  sdk.String("sch"),
+					PolicyName:    "policyName",
+					PolicyKind:    sdk.PolicyKindProjectionPolicy,
+					RefColumnName: sdk.String("name"),
+				},
+			},
+			Expected: map[string]any{
+				"column": []map[string]any{
+					{
+						"column_name": "name",
+						"comment":     "comment",
+						"projection_policy": []map[string]any{
+							{
+								"policy_name": sdk.NewSchemaObjectIdentifier("db", "sch", "policyName").FullyQualifiedName(),
+							},
+						},
+					},
+					{
+						"column_name": "name2",
+						"comment":     "comment2",
+					},
+				},
+			},
+		},
+		{
+			InputColumns: []sdk.ViewDetails{
+				{
+					Name:    "name",
+					Comment: sdk.String("comment"),
+				},
+				{
+					Name:    "name2",
+					Comment: sdk.String("comment2"),
+				},
+			},
+			InputPolicyReferences: []sdk.PolicyReference{
+				{
+					PolicyDb:      sdk.String("db"),
+					PolicySchema:  sdk.String("sch"),
+					PolicyName:    "policyName",
+					PolicyKind:    sdk.PolicyKindProjectionPolicy,
+					RefColumnName: sdk.String("name"),
+				},
+				{
+					PolicyDb:          sdk.String("db"),
+					PolicySchema:      sdk.String("sch"),
+					PolicyName:        "policyName2",
+					PolicyKind:        sdk.PolicyKindMaskingPolicy,
+					RefColumnName:     sdk.String("name"),
+					RefArgColumnNames: sdk.String("[one,two]"),
+				},
+			},
+			Expected: map[string]any{
+				"column": []map[string]any{
+					{
+						"column_name": "name",
+						"comment":     "comment",
+						"projection_policy": []map[string]any{
+							{
+								"policy_name": sdk.NewSchemaObjectIdentifier("db", "sch", "policyName").FullyQualifiedName(),
+							},
+						},
+						"masking_policy": []map[string]any{
+							{
+								"policy_name": sdk.NewSchemaObjectIdentifier("db", "sch", "policyName2").FullyQualifiedName(),
+								"using":       []string{"name", "one", "two"},
+							},
+						},
+					},
+					{
+						"column_name": "name2",
+						"comment":     "comment2",
+					},
+				},
+			},
+		},
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := resources.DiffSuppressStatement(tt.args.k, tt.args.old, tt.args.new, tt.args.d); got != tt.want {
-				t.Errorf("DiffSuppressStatement() = %v, want %v", got, tt.want)
+
+	for i, tc := range testCases {
+		t.Run(fmt.Sprintf("handle columns(%d): %v - %v", i, tc.InputColumns, tc.InputPolicyReferences), func(t *testing.T) {
+			valueSetter := newTestResourceValueSetter()
+			err := handleColumns(valueSetter, tc.InputColumns, tc.InputPolicyReferences)
+			assert.Nil(t, err)
+			assert.Equal(t, tc.Expected, valueSetter.internalMap)
+		})
+	}
+}
+
+func Test_extractColumns(t *testing.T) {
+	testCases := []struct {
+		Input    any
+		Expected []sdk.ViewColumnRequest
+		Error    string
+	}{
+		{
+			Input: "",
+			Error: "unable to extract columns, input is either nil or non expected type (string): ",
+		},
+		{
+			Input: nil,
+			Error: "unable to extract columns, input is either nil or non expected type (<nil>): <nil>",
+		},
+		{
+			Input: []any{""},
+			Error: "unable to extract column, non expected type of string: ",
+		},
+		{
+			Input: []any{
+				map[string]any{},
+			},
+			Error: "unable to extract column, missing column_name key in column",
+		},
+		{
+			Input: []any{
+				map[string]any{
+					"column_name": "abc",
+				},
+			},
+			Expected: []sdk.ViewColumnRequest{
+				*sdk.NewViewColumnRequest("abc"),
+			},
+		},
+		{
+			Input: []any{
+				map[string]any{
+					"column_name": "abc",
+				},
+				map[string]any{
+					"column_name": "cba",
+				},
+			},
+			Expected: []sdk.ViewColumnRequest{
+				*sdk.NewViewColumnRequest("abc"),
+				*sdk.NewViewColumnRequest("cba"),
+			},
+		},
+		{
+			Input: []any{
+				map[string]any{
+					"column_name": "abc",
+					"projection_policy": []any{
+						map[string]any{
+							"policy_name": "db.sch.proj",
+						},
+					},
+					"masking_policy": []any{
+						map[string]any{
+							"policy_name": "db.sch.mask",
+							"using":       []any{"one", "two"},
+						},
+					},
+				},
+				map[string]any{
+					"column_name": "cba",
+				},
+			},
+			Expected: []sdk.ViewColumnRequest{
+				*sdk.NewViewColumnRequest("abc").
+					WithProjectionPolicy(*sdk.NewViewColumnProjectionPolicyRequest(sdk.NewSchemaObjectIdentifier("db", "sch", "proj"))).
+					WithMaskingPolicy(*sdk.NewViewColumnMaskingPolicyRequest(sdk.NewSchemaObjectIdentifier("db", "sch", "mask")).WithUsing([]sdk.Column{{Value: "one"}, {Value: "two"}})),
+				*sdk.NewViewColumnRequest("cba"),
+			},
+		},
+	}
+
+	for i, tc := range testCases {
+		t.Run(fmt.Sprintf("%d: %s", i, tc.Input), func(t *testing.T) {
+			req, err := extractColumns(tc.Input)
+
+			if tc.Error != "" {
+				assert.Nil(t, req)
+				assert.NotNil(t, err)
+				assert.Contains(t, err.Error(), tc.Error)
+			} else {
+				assert.True(t, reflect.DeepEqual(tc.Expected, req))
+				assert.Nil(t, err)
 			}
 		})
 	}
 }
 
-func TestViewRead(t *testing.T) {
-	r := require.New(t)
-
-	in := map[string]interface{}{
-		"name":     "good_name",
-		"database": "test_db",
-		"schema":   "test_schema",
+func Test_extractPolicyWithColumnsList(t *testing.T) {
+	testCases := []struct {
+		Input           any
+		ColumnKey       string
+		ExpectedId      sdk.SchemaObjectIdentifier
+		ExpectedColumns []sdk.Column
+		Error           string
+	}{
+		{
+			Input: []any{
+				map[string]any{
+					"policy_name": "db.sch.pol",
+					"using":       []any{"one", "two"},
+				},
+			},
+			ColumnKey: "non-existing",
+			Error:     "unable to extract policy with column list, unable to find columnsKey: non-existing",
+		},
+		{
+			Input: []any{
+				map[string]any{
+					"policy_name": "db.sch.pol",
+				},
+			},
+			ColumnKey: "using",
+			Error:     "unable to extract policy with column list, unable to find columnsKey: using",
+		},
+		{
+			Input: []any{
+				map[string]any{
+					"policy_name": "db.sch.pol",
+					"using":       []any{"one", "two"},
+				},
+			},
+			ColumnKey:       "using",
+			ExpectedId:      sdk.NewSchemaObjectIdentifier("db", "sch", "pol"),
+			ExpectedColumns: []sdk.Column{{Value: "one"}, {Value: "two"}},
+		},
 	}
 
-	d := view(t, "test_db|test_schema|good_name", in)
+	for i, tc := range testCases {
+		t.Run(fmt.Sprintf("%d: %s", i, tc.Input), func(t *testing.T) {
+			id, cols, err := extractPolicyWithColumnsList(tc.Input, tc.ColumnKey)
 
-	WithMockDb(t, func(db *sql.DB, mock sqlmock.Sqlmock) {
-		// Test when resource is not found, checking if state will be empty
-		r.NotEmpty(d.State())
-		q := snowflake.View("good_name").WithDB("test_db").WithSchema("test_schema").Show()
-		fmt.Println(q)
-		mock.ExpectQuery(q).WillReturnError(sql.ErrNoRows)
-		err := resources.ReadView(d, db)
-		r.Empty(d.State())
-		r.Nil(err)
-	})
+			if tc.Error != "" {
+				assert.NotNil(t, err)
+				assert.Contains(t, err.Error(), tc.Error)
+			} else {
+				assert.Nil(t, err)
+				assert.Equal(t, tc.ExpectedId, id)
+				assert.Equal(t, tc.ExpectedColumns, cols)
+			}
+		})
+	}
 }

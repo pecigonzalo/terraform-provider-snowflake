@@ -5,17 +5,25 @@ description: Manage SnowflakeDB with Terraform.
 
 # Snowflake Provider
 
+~> **Disclaimer** The project is in v1 version, but some features are in preview. Such resources and data sources are considered preview features in the provider, regardless of their state in Snowflake. We do not guarantee their stability. They will be reworked and marked as a stable feature in future releases. Breaking changes in these features are expected, even without bumping the major version. They are disabled by default. To use them, add the relevant feature name to `preview_features_enabled` field in the [provider configuration](https://registry.terraform.io/providers/Snowflake-Labs/snowflake/latest/docs#schema). The list of preview features is available below. Please always refer to the [Getting Help](https://github.com/Snowflake-Labs/terraform-provider-snowflake?tab=readme-ov-file#getting-help) section in our Github repo to best determine how to get help for your questions.
+
+~> **Note** Please check the [migration guide](https://github.com/Snowflake-Labs/terraform-provider-snowflake/blob/main/MIGRATION_GUIDE.md) when changing the version of the provider.
+
+-> **Note** The current roadmap is available in our GitHub repository: [ROADMAP.md](https://github.com/Snowflake-Labs/terraform-provider-snowflake/blob/main/ROADMAP.md).
+
 This is a terraform provider plugin for managing [Snowflake](https://www.snowflake.com/) accounts.
 Coverage is focused on part of Snowflake related to access control.
 
 
 ## Example Provider Configuration
 
+This is an example configuration of the provider in `main.tf` in a configuration directory. More examples are provided [below](#order-precedence).
+
 {{tffile "examples/provider/provider.tf"}}
 
 ## Configuration Schema
 
-**Warning: these values are passed directly to the gosnowflake libarary, which may not work exactly the way you expect. See the [gosnowflake docs](https://godoc.org/github.com/snowflakedb/gosnowflake#hdr-Connection_Parameters) for more.**
+**Warning: these values are passed directly to the gosnowflake library, which may not work exactly the way you expect. See the [gosnowflake docs](https://godoc.org/github.com/snowflakedb/gosnowflake#hdr-Connection_Parameters) for more.**
 
 {{ .SchemaMarkdown | trimspace }}
 
@@ -28,8 +36,9 @@ The Snowflake provider support multiple ways to authenticate:
 * OAuth Refresh Token
 * Browser Auth
 * Private Key
+* Config File
 
-In all cases account, username, and region are required.
+In all cases `organization_name`, `account_name` and `user` are required.
 
 ### Keypair Authentication Environment Variables
 
@@ -46,10 +55,12 @@ To export the variables into your provider:
 
 ```shell
 export SNOWFLAKE_USER="..."
-export SNOWFLAKE_PRIVATE_KEY_PATH="~/.ssh/snowflake_key"
+export SNOWFLAKE_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----..."
+# Alternatively, source from a file.
+export SNOWFLAKE_PRIVATE_KEY=$(cat ~/.ssh/snowflake_key.p8)
 ```
 
-### Keypair Authentication Passhrase
+### Keypair Authentication Passphrase
 
 If your private key requires a passphrase, then this can be supplied via the
 environment variable `SNOWFLAKE_PRIVATE_KEY_PASSPHRASE`.
@@ -68,7 +79,7 @@ To export the variables into your provider:
 
 ```shell
 export SNOWFLAKE_USER="..."
-export SNOWFLAKE_PRIVATE_KEY_PATH="~/.ssh/snowflake_key.p8"
+export SNOWFLAKE_PRIVATE_KEY=$(cat ~/.ssh/snowflake_key.p8)
 export SNOWFLAKE_PRIVATE_KEY_PASSPHRASE="..."
 ```
 
@@ -78,7 +89,7 @@ If you have an OAuth access token, export these credentials as environment varia
 
 ```shell
 export SNOWFLAKE_USER='...'
-export SNOWFLAKE_OAUTH_ACCESS_TOKEN='...'
+export SNOWFLAKE_TOKEN='...'
 ```
 
 Note that once this access token expires, you'll need to request a new one through an external application.
@@ -88,11 +99,11 @@ Note that once this access token expires, you'll need to request a new one throu
 If you have an OAuth Refresh token, export these credentials as environment variables:
 
 ```shell
-export SNOWFLAKE_OAUTH_REFRESH_TOKEN='...'
-export SNOWFLAKE_OAUTH_CLIENT_ID='...'
-export SNOWFLAKE_OAUTH_CLIENT_SECRET='...'
-export SNOWFLAKE_OAUTH_ENDPOINT='...'
-export SNOWFLAKE_OAUTH_REDIRECT_URL='https://localhost.com'
+export SNOWFLAKE_TOKEN_ACCESSOR_REFRESH_TOKEN='...'
+export SNOWFLAKE_TOKEN_ACCESSOR_CLIENT_ID='...'
+export SNOWFLAKE_TOKEN_ACCESSOR_CLIENT_SECRET='...'
+export SNOWFLAKE_TOKEN_ACCESSOR_TOKEN_ENDPOINT='...'
+export SNOWFLAKE_TOKEN_ACCESSOR_REDIRECT_URI='https://localhost.com'
 ```
 
 Note because access token have a short life; typically 10 minutes, by passing refresh token new access token will be generated.
@@ -106,37 +117,75 @@ export SNOWFLAKE_USER='...'
 export SNOWFLAKE_PASSWORD='...'
 ```
 
-## Argument Reference
+## Order Precedence
 
-In addition to [generic `provider` arguments](https://www.terraform.io/docs/configuration/providers.html)
-(e.g. `alias` and `version`), the following arguments are supported in the Snowflake
- `provider` block:
+Currently, the provider can be configured in three ways:
+1. In a Terraform file located in the Terraform module with other resources.
 
-* `account` - (required) The name of the Snowflake account. Can also come from the
-  `SNOWFLAKE_ACCOUNT` environment variable.
-* `username` - (required) Username for username+password authentication. Can come from the
-  `SNOWFLAKE_USER` environment variable.
-* `region` - (required) [Snowflake region](https://docs.snowflake.com/en/user-guide/intro-regions.html) to use. Can be source from the `SNOWFLAKE_REGION` environment variable.
-* `password` - (optional) Password for username+password auth. Cannot be used with `browser_auth` or
-  `private_key_path`. Can be source from `SNOWFLAKE_PASSWORD` environment variable.
-* `oauth_access_token` - (optional) Token for use with OAuth. Generating the token is left to other
-  tools. Cannot be used with `browser_auth`, `private_key_path`, `oauth_refresh_token` or `password`.
-  Can be sourced from `SNOWFLAKE_OAUTH_ACCESS_TOKEN` environment variable.
-* `oauth_refresh_token` - (optional) Token for use with OAuth. Setup and generation of the token is
-  left to other tools. Should be used in conjunction with `oauth_client_id`, `oauth_client_secret`,
-  `oauth_endpoint`, `oauth_redirect_url`. Cannot be used with `browser_auth`, `private_key_path`,
-  `oauth_access_token` or `password`. Can be sourced from `SNOWFLAKE_OAUTH_REFRESH_TOKEN` environment
-  variable.
-* `oauth_client_id` - (optional) Required when `oauth_refresh_token` is used. Can be sourced from
-  `SNOWFLAKE_OAUTH_CLIENT_ID` environment variable.
-* `oauth_client_secret` - (optional) Required when `oauth_refresh_token` is used. Can be sourced from
-  `SNOWFLAKE_OAUTH_CLIENT_SECRET` environment variable.
-* `oauth_endpoint` - (optional) Required when `oauth_refresh_token` is used. Can be sourced from
-  `SNOWFLAKE_OAUTH_ENDPOINT` environment variable.
-* `oauth_redirect_url` - (optional) Required when `oauth_refresh_token` is used. Can be sourced from
-  `SNOWFLAKE_OAUTH_REDIRECT_URL` environment variable.
-* `private_key_path` - (optional) Path to a private key for using keypair authentication.. Cannot be
-  used with `browser_auth`, `oauth_access_token` or `password`. Can be source from
-  `SNOWFLAKE_PRIVATE_KEY_PATH` environment variable.
-* `role` - (optional) Snowflake role to use for operations. If left unset, default role for user
-  will be used. Can come from the `SNOWFLAKE_ROLE` environment variable.
+Example content of the Terraform file configuration:
+
+```terraform
+provider "snowflake" {
+    organization_name = "..."
+    account_name = "..."
+    username = "..."
+    password = "..."
+}
+```
+
+2. In environmental variables (envs). This is mainly used to provide sensitive values.
+
+
+```bash
+export SNOWFLAKE_USER="..."
+export SNOWFLAKE_PRIVATE_KEY="~/.ssh/snowflake_key"
+```
+
+3. In a TOML file (default in ~/.snowflake/config). Notice the use of different profiles. The profile name needs to be specified in the Terraform configuration file in `profile` field. When this is not specified, `default` profile is loaded.
+When a `default` profile is not present in the TOML file, it is treated as "empty", without failing.
+
+Example content of the Terraform file configuration:
+
+```terraform
+provider "snowflake" {
+    profile = "default"
+}
+```
+
+Example content of the TOML file configuration:
+
+```toml
+[default]
+organizationname='organization_name'
+accountname='account_name'
+user='user'
+password='password'
+role='ACCOUNTADMIN'
+
+[secondary_test_account]
+organizationname='organization_name'
+accountname='account2_name'
+user='user'
+password='password'
+role='ACCOUNTADMIN'
+```
+
+Not all fields must be configured in one source; users can choose which fields are configured in which source.
+Provider uses an established hierarchy of sources. The current behavior is that for each field:
+1. Check if it is present in the provider configuration. If yes, use this value. If not, go to step 2.
+1. Check if it is present in the environment variables. If yes, use this value. If not, go to step 3.
+1. Check if it is present in the TOML config file (specifically, use the profile name configured in one of the steps above). If yes, use this value. If not, the value is considered empty.
+
+-> **Note** Currently `private_key` and `private_key_passphrase` are coupled and must be set in one source (both on Terraform side or both in TOML config, see https://github.com/Snowflake-Labs/terraform-provider-snowflake/issues/3332). This will be fixed in the future.
+
+An example TOML file contents:
+
+{{ codefile "toml" "examples/additional/provider_config_toml.MD" | trimspace }}
+
+An example terraform configuration file equivalent:
+
+{{ codefile "terraform" "examples/additional/provider_config_tf.MD" | trimspace }}
+
+{{ index (split (codefile "" "examples/additional/deprecated_resources.MD") "```") 1 | trimspace }}
+
+{{ index (split (codefile "" "examples/additional/deprecated_datasources.MD") "```") 1 | trimspace }}

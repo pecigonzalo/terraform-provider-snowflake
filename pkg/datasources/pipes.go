@@ -1,11 +1,17 @@
 package datasources
 
 import (
-	"database/sql"
+	"context"
 	"fmt"
 	"log"
 
-	"github.com/chanzuckerberg/terraform-provider-snowflake/pkg/snowflake"
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/provider/datasources"
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/provider/previewfeatures"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
+
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/internal/provider"
+
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/sdk"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 )
 
@@ -55,42 +61,41 @@ var pipesSchema = map[string]*schema.Schema{
 
 func Pipes() *schema.Resource {
 	return &schema.Resource{
-		Read:   ReadPipes,
-		Schema: pipesSchema,
+		ReadContext: PreviewFeatureReadWrapper(string(previewfeatures.PipesDatasource), TrackingReadWrapper(datasources.Pipes, ReadPipes)),
+		Schema:      pipesSchema,
 	}
 }
 
-func ReadPipes(d *schema.ResourceData, meta interface{}) error {
-	db := meta.(*sql.DB)
+func ReadPipes(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	client := meta.(*provider.Context).Client
+
 	databaseName := d.Get("database").(string)
 	schemaName := d.Get("schema").(string)
 
-	currentPipes, err := snowflake.ListPipes(databaseName, schemaName, db)
-	if err == sql.ErrNoRows {
-		// If not found, mark resource to be removed from statefile during apply or refresh
-		log.Printf("[DEBUG] pipes in schema (%s) not found", d.Id())
-		d.SetId("")
-		return nil
-	} else if err != nil {
+	extractedPipes, err := client.Pipes.Show(ctx, &sdk.ShowPipeOptions{
+		In: &sdk.In{
+			Schema: sdk.NewDatabaseObjectIdentifier(databaseName, schemaName),
+		},
+	})
+	if err != nil {
 		log.Printf("[DEBUG] unable to parse pipes in schema (%s)", d.Id())
 		d.SetId("")
-		return nil
+		return diag.FromErr(err)
 	}
 
-	pipes := []map[string]interface{}{}
-
-	for _, pipe := range currentPipes {
-		pipeMap := map[string]interface{}{}
+	pipes := make([]map[string]any, 0, len(extractedPipes))
+	for _, pipe := range extractedPipes {
+		pipeMap := map[string]any{}
 
 		pipeMap["name"] = pipe.Name
 		pipeMap["database"] = pipe.DatabaseName
 		pipeMap["schema"] = pipe.SchemaName
 		pipeMap["comment"] = pipe.Comment
-		pipeMap["integration"] = pipe.Integration.String
+		pipeMap["integration"] = pipe.Integration
 
 		pipes = append(pipes, pipeMap)
 	}
 
 	d.SetId(fmt.Sprintf(`%v|%v`, databaseName, schemaName))
-	return d.Set("pipes", pipes)
+	return diag.FromErr(d.Set("pipes", pipes))
 }

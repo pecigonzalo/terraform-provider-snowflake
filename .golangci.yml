@@ -1,7 +1,67 @@
 run:
-  linters:
-    enable:
-      - gofmt
-      - whitespace
-      - unparam
-      - scopelint
+  timeout: 5m
+  skip-files: []
+  # skip-dirs:
+
+linters-settings:
+
+  misspell:
+    locale: US
+  depguard:
+    include-go-root: true
+    packages:
+      - github.com/pkg/error
+      - io/ioutil
+  revive:
+    rules:
+      - name: if-return
+        disabled: true
+linters:
+  disable-all: true
+  enable:
+    - whitespace
+    # unparam: Checks Go code for unused constants, variables, functions and types
+    # - unparam  # todo: enabled
+    # checks for pointers to enclosing loop variables
+    - exportloopref
+    - gocritic
+    - misspell
+    # errcheck: Errcheck is a program for checking for unchecked errors in go programs.
+    - errcheck
+    # gosimple: Linter for Go source code that specializes in simplifying a code
+    - gosimple
+    # govet: Vet examines Go source code and reports suspicious constructs, such as Printf calls whose arguments do not align with the format string
+    - govet
+    # ineffassign: Detects when assignments to existing variables are not used
+    - ineffassign
+    # staticcheck: Finds unused struct fields
+    - staticcheck
+    # typecheck: Like the front-end of a Go compiler, parses and type-checks Go code
+    - typecheck
+    # Inspects source code for security problems
+    - gosec
+    # unconvert: Remove unnecessary type conversions
+    - unconvert
+    # Finds slice declarations that could potentially be pre-allocated
+    - prealloc
+    # gofmt: Gofmt checks whether code was gofmt-ed. By default this tool runs with -s option to check for code simplification
+    - gofmt
+    # gofumpt: Gofumpt checks whether code was gofumpt-ed.
+    - gofumpt
+    # Checks that sentinel errors are prefixed with the Err and error types are suffixed with the Error.
+    - errname
+    # errorlint is a linter for that can be used to find code that will cause problems
+    # with the error wrapping scheme introduced in Go 1.13.
+    - errorlint
+    # thelper detects golang test helpers without t.Helper() call and checks the consistency of test helpers
+    - thelper
+    # wastedassign: wastedassign finds wasted assignment statements.
+    - wastedassign
+    # whitespace: Tool for detection of leading and trailing whitespace
+    - whitespace
+    # In addition to fixing imports, goimports also formats your code in the same style as gofmt.
+    - goimports
+    # Finds slice declarations with non-zero initial length
+    - makezero
+    # Fast, configurable, extensible, flexible, and beautiful linter for Go. Drop-in replacement of golint
+    - revive

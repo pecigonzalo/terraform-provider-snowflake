@@ -1,14 +1,18 @@
 package resources
 
 import (
-	"database/sql"
-	"fmt"
-	"log"
-	"strconv"
+	"context"
 
-	"github.com/chanzuckerberg/terraform-provider-snowflake/pkg/snowflake"
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/provider/previewfeatures"
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/provider/resources"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
+
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/internal/provider"
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/schemas"
+
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/helpers"
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/sdk"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
-	"github.com/pkg/errors"
 )
 
 var sequenceSchema = map[string]*schema.Schema{
@@ -16,6 +20,7 @@ var sequenceSchema = map[string]*schema.Schema{
 		Type:        schema.TypeString,
 		Required:    true,
 		Description: "Specifies the name for the sequence.",
+		ForceNew:    true,
 	},
 	"comment": {
 		Type:        schema.TypeString,
@@ -33,33 +38,40 @@ var sequenceSchema = map[string]*schema.Schema{
 		Type:        schema.TypeString,
 		Required:    true,
 		Description: "The database in which to create the sequence. Don't use the | character.",
+		ForceNew:    true,
 	},
 	"schema": {
 		Type:        schema.TypeString,
 		Required:    true,
 		Description: "The schema in which to create the sequence. Don't use the | character.",
+		ForceNew:    true,
 	},
 	"next_value": {
 		Type:        schema.TypeInt,
-		Description: "The next value the sequence will provide.",
+		Description: "The increment sequence interval.",
 		Computed:    true,
+		ForceNew:    true,
 	},
-	"fully_qualified_name": {
+	"ordering": {
 		Type:        schema.TypeString,
-		Description: "The fully qualified name of the sequence.",
-		Computed:    true,
+		Description: "The ordering of the sequence. Either ORDER or NOORDER. Default is ORDER.",
+		Optional:    true,
+		Default:     "ORDER",
+		ValidateDiagFunc: StringInSlice(
+			[]string{
+				string(sdk.ValuesBehaviorNoOrder),
+				string(sdk.ValuesBehaviorOrder),
+			}, false),
 	},
+	FullyQualifiedNameAttributeName: schemas.FullyQualifiedNameSchema,
 }
 
-var sequenceProperties = []string{"comment", "data_retention_time_in_days"}
-
-// Sequence returns a pointer to the resource representing a sequence
 func Sequence() *schema.Resource {
 	return &schema.Resource{
-		Create: CreateSequence,
-		Read:   ReadSequence,
-		Delete: DeleteSequence,
-		Update: UpdateSequence,
+		CreateContext: PreviewFeatureCreateContextWrapper(string(previewfeatures.SequenceResource), TrackingCreateWrapper(resources.Sequence, CreateSequence)),
+		ReadContext:   PreviewFeatureReadContextWrapper(string(previewfeatures.SequenceResource), TrackingReadWrapper(resources.Sequence, ReadSequence)),
+		UpdateContext: PreviewFeatureUpdateContextWrapper(string(previewfeatures.SequenceResource), TrackingUpdateWrapper(resources.Sequence, UpdateSequence)),
+		DeleteContext: PreviewFeatureDeleteContextWrapper(string(previewfeatures.SequenceResource), TrackingDeleteWrapper(resources.Sequence, DeleteSequence)),
 
 		Schema: sequenceSchema,
 		Importer: &schema.ResourceImporter{
@@ -68,144 +80,123 @@ func Sequence() *schema.Resource {
 	}
 }
 
-// CreateSequence implements schema.CreateFunc
-func CreateSequence(d *schema.ResourceData, meta interface{}) error {
-	db := meta.(*sql.DB)
+func CreateSequence(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	client := meta.(*provider.Context).Client
+
 	database := d.Get("database").(string)
 	schema := d.Get("schema").(string)
 	name := d.Get("name").(string)
+	id := sdk.NewSchemaObjectIdentifier(database, schema, name)
+	req := sdk.NewCreateSequenceRequest(id)
 
-	sq := snowflake.Sequence(name, database, schema)
-
-	if i, ok := d.GetOk("increment"); ok {
-		sq.WithIncrement(i.(int))
+	if v, ok := d.GetOk("increment"); ok {
+		req.WithIncrement(sdk.Int(v.(int)))
 	}
 
 	if v, ok := d.GetOk("comment"); ok {
-		sq.WithComment(v.(string))
+		req.WithComment(sdk.String(v.(string)))
 	}
-
-	err := snowflake.Exec(db, sq.Create())
+	if v, ok := d.GetOk("ordering"); ok {
+		req.WithValuesBehavior(sdk.ValuesBehaviorPointer(sdk.ValuesBehavior(v.(string))))
+	}
+	err := client.Sequences.Create(ctx, req)
 	if err != nil {
-		return errors.Wrapf(err, "error creating sequence")
+		return diag.FromErr(err)
 	}
 
-	return ReadSequence(d, meta)
+	d.SetId(helpers.EncodeSnowflakeID(database, schema, name))
+
+	return ReadSequence(ctx, d, meta)
 }
 
-// ReadSequence implements schema.ReadFunc
-func ReadSequence(d *schema.ResourceData, meta interface{}) error {
-	db := meta.(*sql.DB)
-	database := d.Get("database").(string)
-	schema := d.Get("schema").(string)
-	name := d.Get("name").(string)
+func ReadSequence(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	client := meta.(*provider.Context).Client
 
-	seq := snowflake.Sequence(name, database, schema)
-	stmt := seq.Show()
-	row := snowflake.QueryRow(db, stmt)
-
-	sequence, err := snowflake.ScanSequence(row)
-
+	id := helpers.DecodeSnowflakeID(d.Id()).(sdk.SchemaObjectIdentifier)
+	seq, err := client.Sequences.ShowByID(ctx, id)
 	if err != nil {
-		if err == sql.ErrNoRows {
-			// If not found, mark resource to be removed from statefile during apply or refresh
-			log.Printf("[DEBUG] sequence (%s) not found", d.Id())
-			d.SetId("")
-			return nil
+		return diag.FromErr(err)
+	}
+
+	if err := d.Set("name", seq.Name); err != nil {
+		return diag.FromErr(err)
+	}
+
+	if err := d.Set("schema", seq.SchemaName); err != nil {
+		return diag.FromErr(err)
+	}
+
+	if err := d.Set("database", seq.DatabaseName); err != nil {
+		return diag.FromErr(err)
+	}
+
+	if err := d.Set("comment", seq.Comment); err != nil {
+		return diag.FromErr(err)
+	}
+
+	if err := d.Set("increment", seq.Interval); err != nil {
+		return diag.FromErr(err)
+	}
+
+	if err := d.Set("next_value", seq.NextValue); err != nil {
+		return diag.FromErr(err)
+	}
+	if seq.Ordered {
+		if err := d.Set("ordering", "ORDER"); err != nil {
+			return diag.FromErr(err)
 		}
-		return errors.Wrap(err, "unable to scan row for SHOW SEQUENCES")
+	} else {
+		if err := d.Set("ordering", "NOORDER"); err != nil {
+			return diag.FromErr(err)
+		}
 	}
 
-	err = d.Set("schema", sequence.SchemaName.String)
-	if err != nil {
-		return err
+	if err := d.Set(FullyQualifiedNameAttributeName, id.FullyQualifiedName()); err != nil {
+		return diag.FromErr(err)
 	}
-
-	err = d.Set("database", sequence.DBName.String)
-	if err != nil {
-		return err
-	}
-
-	err = d.Set("comment", sequence.Comment.String)
-	if err != nil {
-		return err
-	}
-
-	i, err := strconv.ParseInt(sequence.Increment.String, 10, 64)
-	if err != nil {
-		return err
-	}
-
-	err = d.Set("increment", i)
-	if err != nil {
-		return err
-	}
-
-	i, err = strconv.ParseInt(sequence.NextValue.String, 10, 64)
-	if err != nil {
-		return err
-	}
-
-	err = d.Set("next_value", i)
-	if err != nil {
-		return err
-	}
-
-	err = d.Set("fully_qualified_name", seq.Address())
-	if err != nil {
-		return err
-	}
-
-	d.SetId(fmt.Sprintf(`%v|%v|%v`, sequence.DBName.String, sequence.SchemaName.String, sequence.Name.String))
-	if err != nil {
-		return err
-	}
-
-	return err
+	return nil
 }
 
-func UpdateSequence(d *schema.ResourceData, meta interface{}) error {
-	db := meta.(*sql.DB)
-	database := d.Get("database").(string)
-	schema := d.Get("schema").(string)
-	name := d.Get("name").(string)
-	next := d.Get("next_value").(int)
+func UpdateSequence(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	client := meta.(*provider.Context).Client
 
-	DeleteSequence(d, meta)
+	id := helpers.DecodeSnowflakeID(d.Id()).(sdk.SchemaObjectIdentifier)
 
-	sq := snowflake.Sequence(name, database, schema)
-
-	if i, ok := d.GetOk("increment"); ok {
-		sq.WithIncrement(i.(int))
+	if d.HasChange("comment") {
+		req := sdk.NewAlterSequenceRequest(id)
+		req.WithSet(sdk.NewSequenceSetRequest().WithComment(sdk.String(d.Get("comment").(string))))
+		if err := client.Sequences.Alter(ctx, req); err != nil {
+			return diag.FromErr(err)
+		}
 	}
 
-	if v, ok := d.GetOk("comment"); ok {
-		sq.WithComment(v.(string))
+	if d.HasChange("increment") {
+		req := sdk.NewAlterSequenceRequest(id)
+		req.WithSetIncrement(sdk.Int(d.Get("increment").(int)))
+		if err := client.Sequences.Alter(ctx, req); err != nil {
+			return diag.FromErr(err)
+		}
 	}
 
-	sq.WithStart(next)
-
-	err := snowflake.Exec(db, sq.Create())
-	if err != nil {
-		return errors.Wrapf(err, "error creating sequence")
+	if d.HasChange("ordering") {
+		req := sdk.NewAlterSequenceRequest(id)
+		req.WithSet(sdk.NewSequenceSetRequest().WithValuesBehavior(sdk.ValuesBehaviorPointer(sdk.ValuesBehavior(d.Get("ordering").(string)))))
+		if err := client.Sequences.Alter(ctx, req); err != nil {
+			return diag.FromErr(err)
+		}
 	}
-
-	return ReadSequence(d, meta)
+	return ReadSequence(ctx, d, meta)
 }
 
-func DeleteSequence(d *schema.ResourceData, meta interface{}) error {
-	db := meta.(*sql.DB)
-	database := d.Get("database").(string)
-	schema := d.Get("schema").(string)
-	name := d.Get("name").(string)
+func DeleteSequence(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	client := meta.(*provider.Context).Client
 
-	stmt := snowflake.Sequence(name, database, schema).Drop()
+	id := helpers.DecodeSnowflakeID(d.Id()).(sdk.SchemaObjectIdentifier)
 
-	err := snowflake.Exec(db, stmt)
+	err := client.Sequences.Drop(ctx, sdk.NewDropSequenceRequest(id).WithIfExists(sdk.Bool(true)))
 	if err != nil {
-		return errors.Wrapf(err, "error dropping sequence %s", name)
+		return diag.FromErr(err)
 	}
-
 	d.SetId("")
 	return nil
 }

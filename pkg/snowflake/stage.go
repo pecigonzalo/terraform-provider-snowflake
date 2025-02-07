@@ -1,26 +1,22 @@
 package snowflake
 
 import (
-	"database/sql"
 	"fmt"
-	"log"
 	"strings"
-
-	"github.com/jmoiron/sqlx"
-	"github.com/pkg/errors"
 )
 
 func fixFileFormat(inputFileFormat string) string {
 	return strings.Replace(inputFileFormat, "NULL_IF = []", "NULL_IF = ()", 1)
 }
 
-// StageBuilder abstracts the creation of SQL queries for a Snowflake stage
+// StageBuilder abstracts the creation of SQL queries for a Snowflake stage.
 type StageBuilder struct {
 	name               string
 	db                 string
 	schema             string
 	url                string
 	credentials        string
+	directory          string
 	storageIntegration string
 	encryption         string
 	fileFormat         string
@@ -29,7 +25,7 @@ type StageBuilder struct {
 	tags               []TagValue
 }
 
-// QualifiedName prepends the db and schema and escapes everything nicely
+// QualifiedName prepends the db and schema and escapes everything nicely.
 func (sb *StageBuilder) QualifiedName() string {
 	var n strings.Builder
 
@@ -38,49 +34,55 @@ func (sb *StageBuilder) QualifiedName() string {
 	return n.String()
 }
 
-// WithURL adds a URL to the StageBuilder
+// WithURL adds a URL to the StageBuilder.
 func (sb *StageBuilder) WithURL(u string) *StageBuilder {
 	sb.url = u
 	return sb
 }
 
-// WithCredentials adds credentials to the StageBuilder
+// WithCredentials adds credentials to the StageBuilder.
 func (sb *StageBuilder) WithCredentials(c string) *StageBuilder {
 	sb.credentials = c
 	return sb
 }
 
-// WithStorageIntegration adds a storage integration to the StageBuilder
+// WithStorageIntegration adds a storage integration to the StageBuilder.
 func (sb *StageBuilder) WithStorageIntegration(s string) *StageBuilder {
 	sb.storageIntegration = s
 	return sb
 }
 
-// WithEncryption adds encryption to the StageBuilder
+// WithEncryption adds encryption to the StageBuilder.
 func (sb *StageBuilder) WithEncryption(e string) *StageBuilder {
 	sb.encryption = e
 	return sb
 }
 
-// WithFileFormat adds a file format to the StageBuilder
+// WithFileFormat adds a file format to the StageBuilder.
 func (sb *StageBuilder) WithFileFormat(f string) *StageBuilder {
 	sb.fileFormat = f
 	return sb
 }
 
-// WithCopyOptions adds copy options to the StageBuilder
+// WithCopyOptions adds copy options to the StageBuilder.
 func (sb *StageBuilder) WithCopyOptions(c string) *StageBuilder {
 	sb.copyOptions = c
 	return sb
 }
 
-// WithComment adds a comment to the StageBuilder
+// WithDirectory adds directory option to the StageBuilder.
+func (sb *StageBuilder) WithDirectory(d string) *StageBuilder {
+	sb.directory = d
+	return sb
+}
+
+// WithComment adds a comment to the StageBuilder.
 func (sb *StageBuilder) WithComment(c string) *StageBuilder {
 	sb.comment = c
 	return sb
 }
 
-// WithTags sets the tags on the ExternalTableBuilder
+// WithTags sets the tags on the ExternalTableBuilder.
 func (sb *StageBuilder) WithTags(tags []TagValue) *StageBuilder {
 	sb.tags = tags
 	return sb
@@ -111,7 +113,7 @@ func (sb *StageBuilder) UnsetTag(tag TagValue) string {
 //   - DESCRIBE STAGE
 //
 // [Snowflake Reference](https://docs.snowflake.net/manuals/sql-reference/ddl-stage.html#stage-management)
-func Stage(name, db, schema string) *StageBuilder {
+func NewStageBuilder(name, db, schema string) *StageBuilder {
 	return &StageBuilder{
 		name:   name,
 		db:     db,
@@ -135,7 +137,7 @@ func (sb *StageBuilder) Create() string {
 	}
 
 	if sb.storageIntegration != "" {
-		q.WriteString(fmt.Sprintf(` STORAGE_INTEGRATION = %v`, sb.storageIntegration))
+		q.WriteString(fmt.Sprintf(` STORAGE_INTEGRATION = "%v"`, sb.storageIntegration))
 	}
 
 	if sb.encryption != "" {
@@ -148,6 +150,10 @@ func (sb *StageBuilder) Create() string {
 
 	if sb.copyOptions != "" {
 		q.WriteString(fmt.Sprintf(` COPY_OPTIONS = (%v)`, sb.copyOptions))
+	}
+
+	if sb.directory != "" {
+		q.WriteString(fmt.Sprintf(` DIRECTORY = (%v)`, sb.directory))
 	}
 
 	if sb.comment != "" {
@@ -184,7 +190,11 @@ func (sb *StageBuilder) ChangeCredentials(c string) string {
 
 // ChangeStorageIntegration returns the SQL query that will update the storage integration on the stage.
 func (sb *StageBuilder) ChangeStorageIntegration(s string) string {
-	return fmt.Sprintf(`ALTER STAGE %v SET STORAGE_INTEGRATION = %v`, sb.QualifiedName(), s)
+	return fmt.Sprintf(`ALTER STAGE %v SET STORAGE_INTEGRATION = "%v"`, sb.QualifiedName(), s)
+}
+
+func (sb *StageBuilder) ChangeStorageIntegrationAndUrl(s string, url string) string {
+	return fmt.Sprintf(`ALTER STAGE %v SET STORAGE_INTEGRATION = "%v" URL = '%v'`, sb.QualifiedName(), s, url)
 }
 
 // ChangeEncryption returns the SQL query that will update the encryption on the stage.
@@ -200,113 +210,4 @@ func (sb *StageBuilder) ChangeFileFormat(f string) string {
 // ChangeCopyOptions returns the SQL query that will update the copy options on the stage.
 func (sb *StageBuilder) ChangeCopyOptions(c string) string {
 	return fmt.Sprintf(`ALTER STAGE %v SET COPY_OPTIONS = (%v)`, sb.QualifiedName(), c)
-}
-
-// Drop returns the SQL query that will drop a stage.
-func (sb *StageBuilder) Drop() string {
-	return fmt.Sprintf(`DROP STAGE %v`, sb.QualifiedName())
-}
-
-// Undrop returns the SQL query that will undrop a stage.
-func (sb *StageBuilder) Undrop() string {
-	return fmt.Sprintf(`UNDROP STAGE %v`, sb.QualifiedName())
-}
-
-// Describe returns the SQL query that will describe a stage.
-func (sb *StageBuilder) Describe() string {
-	return fmt.Sprintf(`DESCRIBE STAGE %v`, sb.QualifiedName())
-}
-
-// Show returns the SQL query that will show a stage.
-func (sb *StageBuilder) Show() string {
-	return fmt.Sprintf(`SHOW STAGES LIKE '%v' IN SCHEMA "%v"."%v"`, sb.name, sb.db, sb.schema)
-}
-
-type stage struct {
-	Name               *string `db:"name"`
-	DatabaseName       *string `db:"database_name"`
-	SchemaName         *string `db:"schema_name"`
-	Comment            *string `db:"comment"`
-	StorageIntegration *string `db:"storage_integration"`
-}
-
-func ScanStageShow(row *sqlx.Row) (*stage, error) {
-	r := &stage{}
-	err := row.StructScan(r)
-	return r, err
-}
-
-type descStageResult struct {
-	Url              string
-	AwsExternalID    string
-	SnowflakeIamUser string
-	FileFormat       string
-	CopyOptions      string
-}
-
-type descStageRow struct {
-	ParentProperty  string `db:"parent_property"`
-	Property        string `db:"property"`
-	PropertyValue   string `db:"property_value"`
-	PropertyDefault string `db:"property_default"`
-}
-
-func DescStage(db *sql.DB, query string) (*descStageResult, error) {
-	r := &descStageResult{}
-	var ff []string
-	var co []string
-	rows, err := Query(db, query)
-	if err != nil {
-		return r, err
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-
-		row := &descStageRow{}
-		if err := rows.StructScan(row); err != nil {
-			return r, err
-		}
-
-		switch row.Property {
-		case "URL":
-			r.Url = strings.Trim(row.PropertyValue, "[\"]")
-		case "AWS_EXTERNAL_ID":
-			r.AwsExternalID = row.PropertyValue
-		case "SNOWFLAKE_IAM_USER":
-			r.SnowflakeIamUser = row.PropertyValue
-		}
-
-		switch row.ParentProperty {
-		case "STAGE_FILE_FORMAT":
-			if row.PropertyValue != row.PropertyDefault {
-				ff = append(ff, fmt.Sprintf("%s = %s", row.Property, row.PropertyValue))
-			}
-		case "STAGE_COPY_OPTIONS":
-			if row.PropertyValue != row.PropertyDefault {
-				co = append(co, fmt.Sprintf("%s = %s", row.Property, row.PropertyValue))
-			}
-		}
-	}
-
-	r.FileFormat = strings.Join(ff, " ")
-	r.CopyOptions = strings.Join(co, " ")
-	return r, nil
-}
-
-func ListStages(databaseName string, schemaName string, db *sql.DB) ([]stage, error) {
-	stmt := fmt.Sprintf(`SHOW STAGES IN SCHEMA "%s"."%v"`, databaseName, schemaName)
-	rows, err := Query(db, stmt)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	dbs := []stage{}
-	err = sqlx.StructScan(rows, &dbs)
-	if err == sql.ErrNoRows {
-		log.Printf("[DEBUG] no stages found")
-		return nil, nil
-	}
-	return dbs, errors.Wrapf(err, "unable to scan row for %s", stmt)
 }

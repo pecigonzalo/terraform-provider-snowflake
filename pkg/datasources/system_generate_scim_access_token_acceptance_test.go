@@ -2,22 +2,23 @@ package datasources_test
 
 import (
 	"fmt"
-	"os"
-	"strings"
 	"testing"
 
-	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/acctest"
-	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/resource"
+	acc "github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/acceptance"
+
+	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
+	"github.com/hashicorp/terraform-plugin-testing/tfversion"
 )
 
 func TestAcc_SystemGenerateSCIMAccessToken(t *testing.T) {
-	if _, ok := os.LookupEnv("SKIP_SCIM_INTEGRATION_TESTS"); ok {
-		t.Skip("Skipping TestAccScimIntegration")
-	}
-
-	scimIntName := strings.ToUpper(acctest.RandStringFromCharSet(10, acctest.CharSetAlpha))
-	resource.ParallelTest(t, resource.TestCase{
-		Providers: providers(),
+	scimIntName := acc.TestClient().Ids.Alpha()
+	resource.Test(t, resource.TestCase{
+		ProtoV6ProviderFactories: acc.TestAccProtoV6ProviderFactories,
+		PreCheck:                 func() { acc.TestAccPreCheck(t) },
+		TerraformVersionChecks: []tfversion.TerraformVersionCheck{
+			tfversion.RequireAbove(tfversion.Version1_5_0),
+		},
+		CheckDestroy: nil,
 		Steps: []resource.TestStep{
 			{
 				Config: generateAccessTokenConfig(scimIntName),
@@ -32,32 +33,30 @@ func TestAcc_SystemGenerateSCIMAccessToken(t *testing.T) {
 
 func generateAccessTokenConfig(name string) string {
 	return fmt.Sprintf(`
-	resource "snowflake_role" "azured" {
+	resource "snowflake_account_role" "azured" {
 		name = "AAD_PROVISIONER"
 		comment = "test comment"
 	}
 
-	resource "snowflake_account_grant" "azurecud" {
-		roles     = [snowflake_role.azured.name]
-		privilege = "CREATE USER"
+	resource "snowflake_grant_privileges_to_account_role" "azure_grants" {
+	  	account_role_name = snowflake_account_role.azured.name
+  		privileges        = ["CREATE USER", "CREATE ROLE"]
+		on_account        = true
 	}
-	resource "snowflake_account_grant" "azurecrd" {
-		roles     = [snowflake_role.azured.name]
-		privilege = "CREATE ROLE"
-	}
-	resource "snowflake_role_grants" "azured" {
-		role_name = snowflake_role.azured.name
-		roles = ["ACCOUNTADMIN"]
+
+	resource "snowflake_grant_account_role" "azured" {
+		role_name        = snowflake_account_role.azured.name
+		parent_role_name = "ACCOUNTADMIN"
 	}
 
 	resource "snowflake_scim_integration" "azured" {
 		name = "%s"
+		enabled = true
 		scim_client = "AZURE"
-		provisioner_role = snowflake_role.azured.name
+		run_as_role = snowflake_account_role.azured.name
 		depends_on = [
-			snowflake_account_grant.azurecud,
-			snowflake_account_grant.azurecrd,
-			snowflake_role_grants.azured
+			snowflake_grant_privileges_to_account_role.azure_grants,
+			snowflake_grant_account_role.azured
 		]
 	}
 

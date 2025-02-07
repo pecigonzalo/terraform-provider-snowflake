@@ -11,13 +11,13 @@ resource "snowflake_sequence" "sequence" {
 }
 
 resource "snowflake_table" "table" {
-  database            = snowflake_schema.schema.database
-  schema              = snowflake_schema.schema.name
-  name                = "table"
-  comment             = "A table."
-  cluster_by          = ["to_date(DATE)"]
-  data_retention_days = snowflake_schema.schema.data_retention_days
-  change_tracking     = false
+  database                    = snowflake_schema.schema.database
+  schema                      = snowflake_schema.schema.name
+  name                        = "table"
+  comment                     = "A table."
+  cluster_by                  = ["to_date(DATE)"]
+  data_retention_time_in_days = snowflake_schema.schema.data_retention_time_in_days
+  change_tracking             = false
 
   column {
     name     = "id"
@@ -44,6 +44,7 @@ resource "snowflake_table" "table" {
     name     = "data"
     type     = "text"
     nullable = false
+    collate  = "en-ci"
   }
 
   column {

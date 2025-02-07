@@ -1,0 +1,27 @@
+{{- /*gotype: github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/acceptance/bettertestspoc/assert/resourceparametersassert/gen.ResourceParametersAssertionsModel*/ -}}
+
+{{- $assertName := .Name | printf "%sResourceParametersAssert" -}}
+{{- $nameLowerCase := FirstLetterLowercase .Name -}}
+type {{ $assertName }} struct {
+    *assert.ResourceAssert
+}
+
+func {{ .Name }}ResourceParameters(t *testing.T, name string) *{{ $assertName }} {
+    t.Helper()
+
+    resourceParameterAssert := {{ $assertName }}{
+        ResourceAssert: assert.NewResourceAssert(name, "parameters"),
+    }
+    resourceParameterAssert.AddAssertion(assert.ValueSet("parameters.#", "1"))
+    return &resourceParameterAssert
+}
+
+func Imported{{ .Name }}ResourceParameters(t *testing.T, id string) *{{ $assertName }} {
+    t.Helper()
+
+    resourceParameterAssert := {{ $assertName }}{
+        ResourceAssert: assert.NewImportedResourceAssert(id, "imported parameters"),
+    }
+    resourceParameterAssert.AddAssertion(assert.ValueSet("parameters.#", "1"))
+    return &resourceParameterAssert
+}

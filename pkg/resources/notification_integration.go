@@ -1,82 +1,104 @@
 package resources
 
 import (
-	"database/sql"
+	"context"
 	"fmt"
 	"log"
 	"strings"
 
-	"github.com/chanzuckerberg/terraform-provider-snowflake/pkg/snowflake"
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/provider/previewfeatures"
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/provider/resources"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
+
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/internal/provider"
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/schemas"
+
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/helpers"
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/sdk"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/validation"
 )
 
+// TODO [SNOW-1348345]: split this resource into smaller ones (SNOW-1021713)
+// TODO [SNOW-1348345]: remove SQS entirely
+// TODO [SNOW-1348345]: support Azure push notifications (AZURE_EVENT_GRID)
 var notificationIntegrationSchema = map[string]*schema.Schema{
 	// The first part of the schema is shared between all integration vendors
-	"name": &schema.Schema{
+	"name": {
 		Type:     schema.TypeString,
 		Required: true,
 		ForceNew: true,
 	},
-	"enabled": &schema.Schema{
+	"enabled": {
 		Type:     schema.TypeBool,
 		Optional: true,
 		Default:  true,
 	},
-	"type": &schema.Schema{
+	"type": {
 		Type:         schema.TypeString,
 		Optional:     true,
 		Default:      "QUEUE",
 		ValidateFunc: validation.StringInSlice([]string{"QUEUE"}, true),
 		Description:  "A type of integration",
-		ForceNew:     true,
+		Deprecated:   "Will be removed - it is added automatically on the SDK level.",
 	},
-	"direction": &schema.Schema{
+	"direction": {
 		Type:         schema.TypeString,
 		Optional:     true,
 		ValidateFunc: validation.StringInSlice([]string{"INBOUND", "OUTBOUND"}, true),
 		Description:  "Direction of the cloud messaging with respect to Snowflake (required only for error notifications)",
-		ForceNew:     true,
+		Deprecated:   "Will be removed - it is added automatically on the SDK level.",
+		DiffSuppressFunc: func(k, old, new string, d *schema.ResourceData) bool {
+			return true
+		},
 	},
 	// This part of the schema is the cloudProviderParams in the Snowflake documentation and differs between vendors
-	"notification_provider": &schema.Schema{
+	"notification_provider": {
 		Type:         schema.TypeString,
-		Optional:     true,
+		Required:     true,
 		ValidateFunc: validation.StringInSlice([]string{"AZURE_STORAGE_QUEUE", "AWS_SQS", "AWS_SNS", "GCP_PUBSUB"}, true),
-		Description:  "The third-party cloud message queuing service (e.g. AZURE_STORAGE_QUEUE, AWS_SQS, AWS_SNS)",
+		Description:  "The third-party cloud message queuing service (supported values: AZURE_STORAGE_QUEUE, AWS_SNS, GCP_PUBSUB; AWS_SQS is deprecated and will be removed in the future provider versions)",
 		ForceNew:     true,
 	},
-	"azure_storage_queue_primary_uri": &schema.Schema{
+	"azure_storage_queue_primary_uri": {
 		Type:        schema.TypeString,
 		Optional:    true,
-		Description: "The queue ID for the Azure Queue Storage queue created for Event Grid notifications",
+		Description: "The queue ID for the Azure Queue Storage queue created for Event Grid notifications. Required for AZURE_STORAGE_QUEUE provider",
+		// There is no alter SQL for azure_storage_queue_primary_uri for automated data loads, therefore it has to be recreated.
+		ForceNew: true,
 	},
-	"azure_tenant_id": &schema.Schema{
+	"azure_tenant_id": {
 		Type:        schema.TypeString,
 		Optional:    true,
-		Description: "The ID of the Azure Active Directory tenant used for identity management",
+		Description: "The ID of the Azure Active Directory tenant used for identity management. Required for AZURE_STORAGE_QUEUE provider",
+		// There is no alter SQL for azure_tenant_id for automated data loads, therefore it has to be recreated.
+		ForceNew: true,
 	},
-	"aws_sqs_external_id": &schema.Schema{
+	"aws_sqs_external_id": {
 		Type:        schema.TypeString,
 		Computed:    true,
 		Description: "The external ID that Snowflake will use when assuming the AWS role",
+		Deprecated:  "No longer supported notification method",
 	},
 	"aws_sqs_iam_user_arn": {
 		Type:        schema.TypeString,
 		Computed:    true,
 		Description: "The Snowflake user that will attempt to assume the AWS role.",
+		Deprecated:  "No longer supported notification method",
 	},
-	"aws_sqs_arn": &schema.Schema{
+	"aws_sqs_arn": {
 		Type:        schema.TypeString,
 		Optional:    true,
 		Description: "AWS SQS queue ARN for notification integration to connect to",
+		Deprecated:  "No longer supported notification method",
 	},
-	"aws_sqs_role_arn": &schema.Schema{
+	"aws_sqs_role_arn": {
 		Type:        schema.TypeString,
 		Optional:    true,
 		Description: "AWS IAM role ARN for notification integration to assume",
+		Deprecated:  "No longer supported notification method",
 	},
-	"aws_sns_external_id": &schema.Schema{
+	"aws_sns_external_id": {
 		Type:        schema.TypeString,
 		Computed:    true,
 		Description: "The external ID that Snowflake will use when assuming the AWS role",
@@ -86,321 +108,305 @@ var notificationIntegrationSchema = map[string]*schema.Schema{
 		Computed:    true,
 		Description: "The Snowflake user that will attempt to assume the AWS role.",
 	},
-	"aws_sns_topic_arn": &schema.Schema{
+	"aws_sns_topic_arn": {
 		Type:        schema.TypeString,
 		Optional:    true,
-		Description: "AWS SNS Topic ARN for notification integration to connect to",
+		Description: "AWS SNS Topic ARN for notification integration to connect to. Required for AWS_SNS provider.",
 	},
-	"aws_sns_role_arn": &schema.Schema{
+	"aws_sns_role_arn": {
 		Type:        schema.TypeString,
 		Optional:    true,
-		Description: "AWS IAM role ARN for notification integration to assume",
+		Description: "AWS IAM role ARN for notification integration to assume. Required for AWS_SNS provider",
 	},
-	"comment": &schema.Schema{
+	"comment": {
 		Type:        schema.TypeString,
 		Optional:    true,
 		Description: "A comment for the integration",
 	},
-	"created_on": &schema.Schema{
+	"created_on": {
 		Type:        schema.TypeString,
 		Computed:    true,
 		Description: "Date and time when the notification integration was created.",
 	},
-	"gcp_pubsub_subscription_name": &schema.Schema{
+	"gcp_pubsub_subscription_name": {
 		Type:        schema.TypeString,
 		Optional:    true,
 		Description: "The subscription id that Snowflake will listen to when using the GCP_PUBSUB provider.",
+		// There is no alter SQL for gcp_pubsub_subscription_name for automated data loads, therefore it has to be recreated.
+		ForceNew:      true,
+		ConflictsWith: []string{"gcp_pubsub_topic_name"},
 	},
+	"gcp_pubsub_topic_name": {
+		Type:        schema.TypeString,
+		Optional:    true,
+		Description: "The topic id that Snowflake will use to push notifications.",
+		// There is no alter SQL for gcp_pubsub_topic_name, therefore it has to be recreated.
+		ForceNew:      true,
+		ConflictsWith: []string{"gcp_pubsub_subscription_name"},
+	},
+	"gcp_pubsub_service_account": {
+		Type:        schema.TypeString,
+		Computed:    true,
+		Description: "The GCP service account identifier that Snowflake will use when assuming the GCP role",
+	},
+	FullyQualifiedNameAttributeName: schemas.FullyQualifiedNameSchema,
 }
 
-// NotificationIntegration returns a pointer to the resource representing a notification integration
+// NotificationIntegration returns a pointer to the resource representing a notification integration.
 func NotificationIntegration() *schema.Resource {
 	return &schema.Resource{
-		Create: CreateNotificationIntegration,
-		Read:   ReadNotificationIntegration,
-		Update: UpdateNotificationIntegration,
-		Delete: DeleteNotificationIntegration,
-		Exists: NotificationIntegrationExists,
+		CreateContext: PreviewFeatureCreateContextWrapper(string(previewfeatures.NotificationIntegrationResource), TrackingCreateWrapper(resources.NotificationIntegration, CreateNotificationIntegration)),
+		ReadContext:   PreviewFeatureReadContextWrapper(string(previewfeatures.NotificationIntegrationResource), TrackingReadWrapper(resources.NotificationIntegration, ReadNotificationIntegration)),
+		UpdateContext: PreviewFeatureUpdateContextWrapper(string(previewfeatures.NotificationIntegrationResource), TrackingUpdateWrapper(resources.NotificationIntegration, UpdateNotificationIntegration)),
+		DeleteContext: PreviewFeatureDeleteContextWrapper(string(previewfeatures.NotificationIntegrationResource), TrackingDeleteWrapper(resources.NotificationIntegration, DeleteNotificationIntegration)),
 
 		Schema: notificationIntegrationSchema,
 		Importer: &schema.ResourceImporter{
-			State: schema.ImportStatePassthrough,
+			StateContext: schema.ImportStatePassthroughContext,
 		},
 	}
 }
 
-// CreateNotificationIntegration implements schema.CreateFunc
-func CreateNotificationIntegration(data *schema.ResourceData, meta interface{}) error {
-	db := meta.(*sql.DB)
-	name := data.Get("name").(string)
+// CreateNotificationIntegration implements schema.CreateFunc.
+func CreateNotificationIntegration(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	client := meta.(*provider.Context).Client
 
-	stmt := snowflake.NotificationIntegration(name).Create()
+	name := d.Get("name").(string)
+	id := sdk.NewAccountObjectIdentifier(name)
+	enabled := d.Get("enabled").(bool)
 
-	// Set required fields
-	stmt.SetString(`TYPE`, data.Get("type").(string))
-	stmt.SetBool(`ENABLED`, data.Get("enabled").(bool))
+	createRequest := sdk.NewCreateNotificationIntegrationRequest(id, enabled)
 
-	// Set optional fields
-	if v, ok := data.GetOk("comment"); ok {
-		stmt.SetString(`COMMENT`, v.(string))
-	}
-	if v, ok := data.GetOk("direction"); ok {
-		stmt.SetString(`DIRECTION`, v.(string))
-	}
-	if v, ok := data.GetOk("azure_tenant_id"); ok {
-		stmt.SetString(`AZURE_TENANT_ID`, v.(string))
-	}
-	if v, ok := data.GetOk("notification_provider"); ok {
-		stmt.SetString(`NOTIFICATION_PROVIDER`, v.(string))
-	}
-	if v, ok := data.GetOk("azure_storage_queue_primary_uri"); ok {
-		stmt.SetString(`AZURE_STORAGE_QUEUE_PRIMARY_URI`, v.(string))
-	}
-	if v, ok := data.GetOk("azure_tenant_id"); ok {
-		stmt.SetString(`AZURE_TENANT_ID`, v.(string))
-	}
-	if v, ok := data.GetOk("aws_sqs_arn"); ok {
-		stmt.SetString(`AWS_SQS_ARN`, v.(string))
-	}
-	if v, ok := data.GetOk("aws_sqs_role_arn"); ok {
-		stmt.SetString(`AWS_SQS_ROLE_ARN`, v.(string))
-	}
-	if v, ok := data.GetOk("aws_sns_topic_arn"); ok {
-		stmt.SetString(`AWS_SNS_TOPIC_ARN`, v.(string))
-	}
-	if v, ok := data.GetOk("aws_sns_role_arn"); ok {
-		stmt.SetString(`AWS_SNS_ROLE_ARN`, v.(string))
-	}
-	if v, ok := data.GetOk("gcp_pubsub_subscription_name"); ok {
-		stmt.SetString(`GCP_PUBSUB_SUBSCRIPTION_NAME`, v.(string))
+	if v, ok := d.GetOk("comment"); ok {
+		createRequest.WithComment(sdk.String(v.(string)))
 	}
 
-	err := snowflake.Exec(db, stmt.Statement())
+	notificationProvider := strings.ToUpper(d.Get("notification_provider").(string))
+	switch notificationProvider {
+	case "AWS_SNS":
+		topic, ok := d.GetOk("aws_sns_topic_arn")
+		if !ok {
+			return diag.FromErr(fmt.Errorf("if you use AWS_SNS provider you must specify an aws_sns_topic_arn"))
+		}
+		role, ok := d.GetOk("aws_sns_role_arn")
+		if !ok {
+			return diag.FromErr(fmt.Errorf("if you use AWS_SNS provider you must specify an aws_sns_role_arn"))
+		}
+		createRequest.WithPushNotificationParams(
+			sdk.NewPushNotificationParamsRequest().WithAmazonPushParams(sdk.NewAmazonPushParamsRequest(topic.(string), role.(string))),
+		)
+	case "GCP_PUBSUB":
+		if v, ok := d.GetOk("gcp_pubsub_subscription_name"); ok {
+			createRequest.WithAutomatedDataLoadsParams(
+				sdk.NewAutomatedDataLoadsParamsRequest().WithGoogleAutoParams(sdk.NewGoogleAutoParamsRequest(v.(string))),
+			)
+		}
+		if v, ok := d.GetOk("gcp_pubsub_topic_name"); ok {
+			createRequest.WithPushNotificationParams(
+				sdk.NewPushNotificationParamsRequest().WithGooglePushParams(sdk.NewGooglePushParamsRequest(v.(string))),
+			)
+		}
+	case "AZURE_STORAGE_QUEUE":
+		uri, ok := d.GetOk("azure_storage_queue_primary_uri")
+		if !ok {
+			return diag.FromErr(fmt.Errorf("if you use AZURE_STORAGE_QUEUE provider you must specify an azure_storage_queue_primary_uri"))
+		}
+		tenantId, ok := d.GetOk("azure_tenant_id")
+		if !ok {
+			return diag.FromErr(fmt.Errorf("if you use AZURE_STORAGE_QUEUE provider you must specify an azure_tenant_id"))
+		}
+		createRequest.WithAutomatedDataLoadsParams(
+			sdk.NewAutomatedDataLoadsParamsRequest().WithAzureAutoParams(sdk.NewAzureAutoParamsRequest(uri.(string), tenantId.(string))),
+		)
+	default:
+		return diag.FromErr(fmt.Errorf("unexpected provider %v", notificationProvider))
+	}
+
+	err := client.NotificationIntegrations.Create(ctx, createRequest)
 	if err != nil {
-		return fmt.Errorf("error creating notification integration: %w", err)
+		return diag.FromErr(fmt.Errorf("error creating notification integration: %w", err))
 	}
 
-	data.SetId(name)
+	d.SetId(helpers.EncodeSnowflakeID(id))
 
-	return ReadNotificationIntegration(data, meta)
+	return ReadNotificationIntegration(ctx, d, meta)
 }
 
-// ReadNotificationIntegration implements schema.ReadFunc
-func ReadNotificationIntegration(data *schema.ResourceData, meta interface{}) error {
-	db := meta.(*sql.DB)
-	id := data.Id()
+// ReadNotificationIntegration implements schema.ReadFunc.
+func ReadNotificationIntegration(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	client := meta.(*provider.Context).Client
 
-	stmt := snowflake.NotificationIntegration(data.Id()).Show()
-	row := snowflake.QueryRow(db, stmt)
+	id := helpers.DecodeSnowflakeID(d.Id()).(sdk.AccountObjectIdentifier)
 
-	// Some properties can come from the SHOW INTEGRATION call
-
-	s, err := snowflake.ScanNotificationIntegration(row)
+	integration, err := client.NotificationIntegrations.ShowByID(ctx, id)
 	if err != nil {
-		return fmt.Errorf("Could not show notification integration: %w", err)
+		log.Printf("[DEBUG] notification integration (%s) not found", d.Id())
+		d.SetId("")
+		return diag.FromErr(err)
 	}
 
 	// Note: category must be NOTIFICATION or something is broken
-	if c := s.Category.String; c != "NOTIFICATION" {
-		return fmt.Errorf("Expected %v to be a NOTIFICATION integration, got %v", id, c)
+	if c := integration.Category; c != "NOTIFICATION" {
+		return diag.FromErr(fmt.Errorf("expected %v to be a NOTIFICATION integration, got %v", id, c))
+	}
+	if err := d.Set(FullyQualifiedNameAttributeName, id.FullyQualifiedName()); err != nil {
+		return diag.FromErr(err)
+	}
+	if err := d.Set("name", integration.Name); err != nil {
+		return diag.FromErr(err)
 	}
 
-	if err := data.Set("name", s.Name.String); err != nil {
-		return err
+	if err := d.Set("comment", integration.Comment); err != nil {
+		return diag.FromErr(err)
+	}
+
+	if err := d.Set("created_on", integration.CreatedOn.String()); err != nil {
+		return diag.FromErr(err)
+	}
+
+	if err := d.Set("enabled", integration.Enabled); err != nil {
+		return diag.FromErr(err)
 	}
 
 	// Snowflake returns "QUEUE - AZURE_STORAGE_QUEUE" instead of simple "QUEUE" as a type
-	// so it needs to be parsed in order to not show a diff in Terraform
-	typeParts := strings.Split(s.Type.String, "-")
+	// It needs to be parsed in order to not show a diff in Terraform.
+	typeParts := strings.Split(integration.NotificationType, "-")
 	parsedType := strings.TrimSpace(typeParts[0])
-	if err = data.Set("type", parsedType); err != nil {
-		return err
-	}
-
-	if err := data.Set("created_on", s.CreatedOn.String); err != nil {
-		return err
-	}
-
-	if err := data.Set("enabled", s.Enabled.Bool); err != nil {
-		return err
+	if err := d.Set("type", parsedType); err != nil {
+		return diag.FromErr(err)
 	}
 
 	// Some properties come from the DESCRIBE INTEGRATION call
-	// We need to grab them in a loop
-	var k, pType string
-	var v, d interface{}
-	stmt = snowflake.NotificationIntegration(data.Id()).Describe()
-	rows, err := db.Query(stmt)
+	integrationProperties, err := client.NotificationIntegrations.Describe(ctx, id)
 	if err != nil {
-		return fmt.Errorf("Could not describe notification integration: %w", err)
+		return diag.FromErr(fmt.Errorf("could not describe notification integration: %w", err))
 	}
-	defer rows.Close()
-	for rows.Next() {
-		if err := rows.Scan(&k, &pType, &v, &d); err != nil {
-			return err
-		}
-		switch k {
+	for _, property := range integrationProperties {
+		name := property.Name
+		value := property.Value
+		switch name {
 		case "ENABLED":
 			// We set this using the SHOW INTEGRATION call so let's ignore it here
 		case "DIRECTION":
-			if err = data.Set("direction", v.(string)); err != nil {
-				return err
+			if err := d.Set("direction", value); err != nil {
+				return diag.FromErr(err)
 			}
 		case "NOTIFICATION_PROVIDER":
-			if err = data.Set("notification_provider", v.(string)); err != nil {
-				return err
+			if err := d.Set("notification_provider", value); err != nil {
+				return diag.FromErr(err)
 			}
 		case "AZURE_STORAGE_QUEUE_PRIMARY_URI":
-			if err = data.Set("azure_storage_queue_primary_uri", v.(string)); err != nil {
-				return err
+			if err := d.Set("azure_storage_queue_primary_uri", value); err != nil {
+				return diag.FromErr(err)
+			}
+			// NOTIFICATION_PROVIDER is not returned for azure automated data load, so we set it manually in such a case
+			if err := d.Set("notification_provider", "AZURE_STORAGE_QUEUE"); err != nil {
+				return diag.FromErr(err)
 			}
 		case "AZURE_TENANT_ID":
-			if err = data.Set("azure_tenant_id", v.(string)); err != nil {
-				return err
-			}
-		case "AWS_SQS_ARN":
-			if err = data.Set("aws_sqs_arn", v.(string)); err != nil {
-				return err
-			}
-		case "AWS_SQS_ROLE_ARN":
-			if err = data.Set("aws_sqs_role_arn", v.(string)); err != nil {
-				return err
-			}
-		case "AWS_SQS_EXTERNAL_ID":
-			if err = data.Set("aws_sqs_external_id", v.(string)); err != nil {
-				return err
-			}
-		case "AWS_SQS_IAM_USER_ARN":
-			if err = data.Set("aws_sqs_iam_user_arn", v.(string)); err != nil {
-				return err
+			if err := d.Set("azure_tenant_id", value); err != nil {
+				return diag.FromErr(err)
 			}
 		case "AWS_SNS_TOPIC_ARN":
-			if err = data.Set("aws_sns_topic_arn", v.(string)); err != nil {
-				return err
+			if err := d.Set("aws_sns_topic_arn", value); err != nil {
+				return diag.FromErr(err)
 			}
 		case "AWS_SNS_ROLE_ARN":
-			if err = data.Set("aws_sns_role_arn", v.(string)); err != nil {
-				return err
+			if err := d.Set("aws_sns_role_arn", value); err != nil {
+				return diag.FromErr(err)
 			}
 		case "SF_AWS_EXTERNAL_ID":
-			if err = data.Set("aws_sns_external_id", v.(string)); err != nil {
-				return err
+			if err := d.Set("aws_sns_external_id", value); err != nil {
+				return diag.FromErr(err)
 			}
 		case "SF_AWS_IAM_USER_ARN":
-			if err = data.Set("aws_sns_iam_user_arn", v.(string)); err != nil {
-				return err
+			if err := d.Set("aws_sns_iam_user_arn", value); err != nil {
+				return diag.FromErr(err)
 			}
 		case "GCP_PUBSUB_SUBSCRIPTION_NAME":
-			if err = data.Set("gcp_pubsub_subscription_name", v.(string)); err != nil {
-				return err
+			if err := d.Set("gcp_pubsub_subscription_name", value); err != nil {
+				return diag.FromErr(err)
+			}
+			// NOTIFICATION_PROVIDER is not returned for gcp, so we set it manually in such a case
+			if err := d.Set("notification_provider", "GCP_PUBSUB"); err != nil {
+				return diag.FromErr(err)
+			}
+		case "GCP_PUBSUB_TOPIC_NAME":
+			if err := d.Set("gcp_pubsub_topic_name", value); err != nil {
+				return diag.FromErr(err)
+			}
+			// NOTIFICATION_PROVIDER is not returned for gcp, so we set it manually in such a case
+			if err := d.Set("notification_provider", "GCP_PUBSUB"); err != nil {
+				return diag.FromErr(err)
+			}
+		case "GCP_PUBSUB_SERVICE_ACCOUNT":
+			if err := d.Set("gcp_pubsub_service_account", value); err != nil {
+				return diag.FromErr(err)
 			}
 		default:
-			log.Printf("[WARN] unexpected property %v returned from Snowflake", k)
+			log.Printf("[WARN] unexpected property %v returned from Snowflake", name)
 		}
 	}
 
-	return err
+	return diag.FromErr(err)
 }
 
-// UpdateNotificationIntegration implements schema.UpdateFunc
-func UpdateNotificationIntegration(data *schema.ResourceData, meta interface{}) error {
-	db := meta.(*sql.DB)
-	id := data.Id()
+// UpdateNotificationIntegration implements schema.UpdateFunc.
+func UpdateNotificationIntegration(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	client := meta.(*provider.Context).Client
 
-	stmt := snowflake.NotificationIntegration(id).Alter()
+	id := helpers.DecodeSnowflakeID(d.Id()).(sdk.AccountObjectIdentifier)
 
-	// This is required in case the only change is to UNSET STORAGE_ALLOWED_LOCATIONS.
-	// Not sure if there is a more elegant way of determining this
 	var runSetStatement bool
-
-	if data.HasChange("comment") {
+	setRequest := sdk.NewNotificationIntegrationSetRequest()
+	if d.HasChange("comment") {
 		runSetStatement = true
-		stmt.SetString("COMMENT", data.Get("comment").(string))
+		setRequest.WithComment(sdk.String(d.Get("comment").(string)))
 	}
 
-	if data.HasChange("type") {
+	if d.HasChange("enabled") {
 		runSetStatement = true
-		stmt.SetString("TYPE", data.Get("type").(string))
+		setRequest.WithEnabled(sdk.Bool(d.Get("enabled").(bool)))
 	}
 
-	if data.HasChange("enabled") {
-		runSetStatement = true
-		stmt.SetBool(`ENABLED`, data.Get("enabled").(bool))
-	}
-
-	if data.HasChange("direction") {
-		runSetStatement = true
-		stmt.SetString("DIRECTION", data.Get("direction").(string))
-	}
-
-	if data.HasChange("notification_provider") {
-		runSetStatement = true
-		stmt.SetString("NOTIFICATION_PROVIDER", data.Get("notification_provider").(string))
-	}
-
-	if data.HasChange("azure_storage_queue_primary_uri") {
-		runSetStatement = true
-		stmt.SetString("AZURE_STORAGE_QUEUE_PRIMARY_URI", data.Get("azure_storage_queue_primary_uri").(string))
-	}
-
-	if data.HasChange("azure_tenant_id") {
-		runSetStatement = true
-		stmt.SetString("AZURE_TENANT_ID", data.Get("azure_tenant_id").(string))
-	}
-
-	if data.HasChange("aws_sqs_arn") {
-		runSetStatement = true
-		stmt.SetString("AWS_SQS_ARN", data.Get("aws_sqs_arn").(string))
-	}
-
-	if data.HasChange("aws_sqs_role_arn") {
-		runSetStatement = true
-		stmt.SetString("AWS_SQS_ROLE_ARN", data.Get("aws_sqs_role_arn").(string))
-	}
-
-	if data.HasChange("aws_sns_topic_arn") {
-		runSetStatement = true
-		stmt.SetString("AWS_SNS_TOPIC_ARN", data.Get("aws_sns_topic_arn").(string))
-	}
-
-	if data.HasChange("aws_sns_role_arn") {
-		runSetStatement = true
-		stmt.SetString("AWS_SNS_ROLE_ARN", data.Get("aws_sns_role_arn").(string))
-	}
-
-	if data.HasChange("gcp_pubsub_subscription_name") {
-		runSetStatement = true
-		stmt.SetString("GCP_PUBSUB_SUBSCRIPTION_NAME", data.Get("gcp_pubsub_subscription_name").(string))
+	notificationProvider := strings.ToUpper(d.Get("notification_provider").(string))
+	switch notificationProvider {
+	case "AWS_SNS":
+		if d.HasChange("aws_sns_topic_arn") || d.HasChange("aws_sns_role_arn") {
+			runSetStatement = true
+			setAmazonPush := sdk.NewSetAmazonPushRequest(d.Get("aws_sns_topic_arn").(string), d.Get("aws_sns_role_arn").(string))
+			setRequest.WithSetPushParams(sdk.NewSetPushParamsRequest().WithSetAmazonPush(setAmazonPush))
+		}
+	case "GCP_PUBSUB":
+		log.Printf("[WARN] all GCP_PUBSUB properties should recreate the resource")
+	case "AZURE_STORAGE_QUEUE":
+		log.Printf("[WARN] all AZURE_STORAGE_QUEUE properties should recreate the resource")
+	default:
+		return diag.FromErr(fmt.Errorf("unexpected provider %v", notificationProvider))
 	}
 
 	if runSetStatement {
-		if err := snowflake.Exec(db, stmt.Statement()); err != nil {
-			return fmt.Errorf("error updating notification integration: %w", err)
+		err := client.NotificationIntegrations.Alter(ctx, sdk.NewAlterNotificationIntegrationRequest(id).WithSet(setRequest))
+		if err != nil {
+			return diag.FromErr(fmt.Errorf("error updating notification integration: %w", err))
 		}
 	}
 
-	return ReadNotificationIntegration(data, meta)
+	return ReadNotificationIntegration(ctx, d, meta)
 }
 
-// DeleteNotificationIntegration implements schema.DeleteFunc
-func DeleteNotificationIntegration(data *schema.ResourceData, meta interface{}) error {
-	return DeleteResource("", snowflake.NotificationIntegration)(data, meta)
-}
+// DeleteNotificationIntegration implements schema.DeleteFunc.
+func DeleteNotificationIntegration(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	client := meta.(*provider.Context).Client
 
-// NotificationIntegrationExists implements schema.ExistsFunc
-func NotificationIntegrationExists(data *schema.ResourceData, meta interface{}) (bool, error) {
-	db := meta.(*sql.DB)
-	id := data.Id()
+	id := helpers.DecodeSnowflakeID(d.Id()).(sdk.AccountObjectIdentifier)
 
-	stmt := snowflake.NotificationIntegration(id).Show()
-	rows, err := db.Query(stmt)
+	err := client.NotificationIntegrations.Drop(ctx, sdk.NewDropNotificationIntegrationRequest(id))
 	if err != nil {
-		return false, err
+		return diag.FromErr(err)
 	}
-	defer rows.Close()
 
-	if rows.Next() {
-		return true, nil
-	}
-	return false, nil
+	d.SetId("")
+
+	return nil
 }

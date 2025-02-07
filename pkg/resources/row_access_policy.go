@@ -1,314 +1,323 @@
 package resources
 
 import (
-	"bytes"
-	"database/sql"
-	"encoding/csv"
+	"context"
+	"errors"
 	"fmt"
-	"strings"
+	"log"
 
-	"github.com/chanzuckerberg/terraform-provider-snowflake/pkg/snowflake"
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/helpers"
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/internal/provider"
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/provider/resources"
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/schemas"
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/sdk"
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/sdk/datatypes"
+	"github.com/hashicorp/go-cty/cty"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/customdiff"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
-	"github.com/pkg/errors"
-)
-
-const (
-	rowAccessPolicyIDDelimiter = '|'
 )
 
 var rowAccessPolicySchema = map[string]*schema.Schema{
 	"name": {
-		Type:        schema.TypeString,
-		Required:    true,
-		Description: "Specifies the identifier for the row access policy; must be unique for the database and schema in which the row access policy is created.",
-		ForceNew:    true,
+		Type:             schema.TypeString,
+		Required:         true,
+		Description:      blocklistedCharactersFieldDescription("Specifies the identifier for the row access policy; must be unique for the database and schema in which the row access policy is created."),
+		DiffSuppressFunc: suppressIdentifierQuoting,
 	},
 	"database": {
-		Type:        schema.TypeString,
-		Required:    true,
-		Description: "The database in which to create the row access policy.",
-		ForceNew:    true,
+		Type:             schema.TypeString,
+		Required:         true,
+		Description:      blocklistedCharactersFieldDescription("The database in which to create the row access policy."),
+		ForceNew:         true,
+		DiffSuppressFunc: suppressIdentifierQuoting,
 	},
 	"schema": {
-		Type:        schema.TypeString,
+		Type:             schema.TypeString,
+		Required:         true,
+		Description:      blocklistedCharactersFieldDescription("The schema in which to create the row access policy."),
+		ForceNew:         true,
+		DiffSuppressFunc: suppressIdentifierQuoting,
+	},
+	"argument": {
+		Type: schema.TypeList,
+		Elem: &schema.Resource{
+			Schema: map[string]*schema.Schema{
+				"name": {
+					Type:        schema.TypeString,
+					Required:    true,
+					Description: "The argument name",
+					ForceNew:    true,
+				},
+				// TODO(SNOW-1596962): Fully support VECTOR data type sdk.ParseFunctionArgumentsFromString could be a base for another function that takes argument names into consideration.
+				"type": {
+					Type:             schema.TypeString,
+					Required:         true,
+					DiffSuppressFunc: DiffSuppressDataTypes,
+					ValidateDiagFunc: IsDataTypeValid,
+					Description:      dataTypeFieldDescription("The argument type. VECTOR data types are not yet supported."),
+					ForceNew:         true,
+				},
+			},
+		},
 		Required:    true,
-		Description: "The schema in which to create the row access policy.",
+		Description: "List of the arguments for the row access policy. A signature specifies a set of attributes that must be considered to determine whether the row is accessible. The attribute values come from the database object (e.g. table or view) to be protected by the row access policy. If any argument name or type is changed, the resource is recreated.",
 		ForceNew:    true,
 	},
-	"signature": {
-		Type:        schema.TypeMap,
-		Elem:        &schema.Schema{Type: schema.TypeString},
-		Required:    true,
-		ForceNew:    true,
-		Description: "Specifies signature (arguments) for the row access policy (uppercase and sorted to avoid recreation of resource). A signature specifies a set of attributes that must be considered to determine whether the row is accessible. The attribute values come from the database object (e.g. table or view) to be protected by the row access policy.",
-		//Implement DiffSuppressFunc after https://github.com/hashicorp/terraform-plugin-sdk/issues/477 is solved
-	},
-	"row_access_expression": {
-		Type:        schema.TypeString,
-		Required:    true,
-		Description: "Specifies the SQL expression. The expression can be any boolean-valued SQL expression.",
+	"body": {
+		Type:             schema.TypeString,
+		Required:         true,
+		Description:      diffSuppressStatementFieldDescription("Specifies the SQL expression. The expression can be any boolean-valued SQL expression."),
+		DiffSuppressFunc: DiffSuppressStatement,
 	},
 	"comment": {
 		Type:        schema.TypeString,
 		Optional:    true,
 		Description: "Specifies a comment for the row access policy.",
 	},
+	ShowOutputAttributeName: {
+		Type:        schema.TypeList,
+		Computed:    true,
+		Description: "Outputs the result of `SHOW ROW ACCESS POLICIES` for the given row access policy.",
+		Elem: &schema.Resource{
+			Schema: schemas.ShowRowAccessPolicySchema,
+		},
+	},
+	DescribeOutputAttributeName: {
+		Type:        schema.TypeList,
+		Computed:    true,
+		Description: "Outputs the result of `DESCRIBE ROW ACCESS POLICY` for the given row access policy.",
+		Elem: &schema.Resource{
+			Schema: schemas.RowAccessPolicyDescribeSchema,
+		},
+	},
+	FullyQualifiedNameAttributeName: schemas.FullyQualifiedNameSchema,
 }
 
-type rowAccessPolicyID struct {
-	DatabaseName        string
-	SchemaName          string
-	RowAccessPolicyName string
-}
-
-// String() takes in a rowAccessPolicyID object and returns a pipe-delimited string:
-// DatabaseName|SchemaName|RowAccessPolicyName
-func (rapi *rowAccessPolicyID) String() (string, error) {
-	var buf bytes.Buffer
-	csvWriter := csv.NewWriter(&buf)
-	csvWriter.Comma = rowAccessPolicyIDDelimiter
-	dataIdentifiers := [][]string{{rapi.DatabaseName, rapi.SchemaName, rapi.RowAccessPolicyName}}
-	err := csvWriter.WriteAll(dataIdentifiers)
-	if err != nil {
-		return "", err
-	}
-	strRowAccessPolicyID := strings.TrimSpace(buf.String())
-	return strRowAccessPolicyID, nil
-}
-
-/// rowAccessPolicyIDFromString() takes in a pipe-delimited string: DatabaseName|SchemaName|RowAccessPolicyName
-// and returns a rowAccessPolicyID object
-func rowAccessPolicyIDFromString(stringID string) (*rowAccessPolicyID, error) {
-	reader := csv.NewReader(strings.NewReader(stringID))
-	reader.Comma = rowAccessPolicyIDDelimiter
-	lines, err := reader.ReadAll()
-	if err != nil {
-		return nil, fmt.Errorf("Not CSV compatible")
-	}
-
-	if len(lines) != 1 {
-		return nil, fmt.Errorf("1 line per row access policy")
-	}
-	if len(lines[0]) != 3 {
-		return nil, fmt.Errorf("3 fields allowed")
-	}
-
-	rowAccessPolicyResult := &rowAccessPolicyID{
-		DatabaseName:        lines[0][0],
-		SchemaName:          lines[0][1],
-		RowAccessPolicyName: lines[0][2],
-	}
-	return rowAccessPolicyResult, nil
-}
-
-// RowAccessPolicy returns a pointer to the resource representing a row access policy
+// RowAccessPolicy returns a pointer to the resource representing a row access policy.
 func RowAccessPolicy() *schema.Resource {
 	return &schema.Resource{
-		Create: CreateRowAccessPolicy,
-		Read:   ReadRowAccessPolicy,
-		Update: UpdateRowAccessPolicy,
-		Delete: DeleteRowAccessPolicy,
+		SchemaVersion: 1,
+
+		CreateContext: TrackingCreateWrapper(resources.RowAccessPolicy, CreateRowAccessPolicy),
+		ReadContext:   TrackingReadWrapper(resources.RowAccessPolicy, ReadRowAccessPolicy),
+		UpdateContext: TrackingUpdateWrapper(resources.RowAccessPolicy, UpdateRowAccessPolicy),
+		DeleteContext: TrackingDeleteWrapper(resources.RowAccessPolicy, DeleteRowAccessPolicy),
+		Description:   "Resource used to manage row access policy objects. For more information, check [row access policy documentation](https://docs.snowflake.com/en/sql-reference/sql/create-row-access-policy).",
 
 		Schema: rowAccessPolicySchema,
 		Importer: &schema.ResourceImporter{
-			StateContext: schema.ImportStatePassthroughContext,
+			StateContext: TrackingImportWrapper(resources.RowAccessPolicy, ImportRowAccessPolicy),
+		},
+
+		CustomizeDiff: TrackingCustomDiffWrapper(resources.RowAccessPolicy, customdiff.All(
+			ComputedIfAnyAttributeChanged(rowAccessPolicySchema, ShowOutputAttributeName, "comment", "name"),
+			ComputedIfAnyAttributeChanged(rowAccessPolicySchema, DescribeOutputAttributeName, "body", "name", "signature"),
+			ComputedIfAnyAttributeChanged(rowAccessPolicySchema, FullyQualifiedNameAttributeName, "name"),
+		)),
+
+		StateUpgraders: []schema.StateUpgrader{
+			{
+				Version: 0,
+				// setting type to cty.EmptyObject is a bit hacky here but following https://developer.hashicorp.com/terraform/plugin/framework/migrating/resources/state-upgrade#sdkv2-1 would require lots of repetitive code; this should work with cty.EmptyObject
+				Type:    cty.EmptyObject,
+				Upgrade: v0_95_0_RowAccessPolicyStateUpgrader,
+			},
 		},
 	}
 }
 
-// CreateRowAccessPolicy implements schema.CreateFunc
-func CreateRowAccessPolicy(d *schema.ResourceData, meta interface{}) error {
-	db := meta.(*sql.DB)
+func ImportRowAccessPolicy(ctx context.Context, d *schema.ResourceData, meta any) ([]*schema.ResourceData, error) {
+	log.Printf("[DEBUG] Starting row access policy import")
+	client := meta.(*provider.Context).Client
+	id, err := sdk.ParseSchemaObjectIdentifier(d.Id())
+	if err != nil {
+		return nil, err
+	}
+
+	policy, err := client.RowAccessPolicies.ShowByID(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if err := d.Set("name", id.Name()); err != nil {
+		return nil, err
+	}
+	if err := d.Set("database", id.DatabaseName()); err != nil {
+		return nil, err
+	}
+	if err := d.Set("schema", id.SchemaName()); err != nil {
+		return nil, err
+	}
+	if err := d.Set("comment", policy.Comment); err != nil {
+		return nil, err
+	}
+	policyDescription, err := client.RowAccessPolicies.Describe(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if err := d.Set("body", policyDescription.Body); err != nil {
+		return nil, err
+	}
+	if err := d.Set("argument", schemas.RowAccessPolicyArgumentsToSchema(policyDescription.Signature)); err != nil {
+		return nil, err
+	}
+	return []*schema.ResourceData{d}, nil
+}
+
+func CreateRowAccessPolicy(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	client := meta.(*provider.Context).Client
+
+	databaseName := d.Get("database").(string)
+	schemaName := d.Get("schema").(string)
 	name := d.Get("name").(string)
-	database := d.Get("database").(string)
-	schema := d.Get("schema").(string)
-	signature := d.Get("signature").(map[string]interface{})
-	rowAccessExpression := d.Get("row_access_expression").(string)
+	id := sdk.NewSchemaObjectIdentifier(databaseName, schemaName, name)
 
-	builder := snowflake.RowAccessPolicy(name, database, schema)
+	arguments := d.Get("argument").([]any)
+	rowAccessExpression := d.Get("body").(string)
 
-	builder.WithSignature(signature)
-	builder.WithRowAccessExpression(rowAccessExpression)
+	args := make([]sdk.CreateRowAccessPolicyArgsRequest, 0)
+	for _, arg := range arguments {
+		v := arg.(map[string]any)
+		dataType, err := datatypes.ParseDataType(v["type"].(string))
+		if err != nil {
+			return diag.FromErr(err)
+		}
+		args = append(args, *sdk.NewCreateRowAccessPolicyArgsRequest(v["name"].(string), sdk.LegacyDataTypeFrom(dataType)))
+	}
+
+	createRequest := sdk.NewCreateRowAccessPolicyRequest(id, args, rowAccessExpression)
 
 	// Set optionals
 	if v, ok := d.GetOk("comment"); ok {
-		builder.WithComment(v.(string))
+		createRequest.WithComment(sdk.String(v.(string)))
 	}
 
-	stmt := builder.Create()
-	err := snowflake.Exec(db, stmt)
+	err := client.RowAccessPolicies.Create(ctx, createRequest)
 	if err != nil {
-		return errors.Wrapf(err, "error creating row access policy %v", name)
+		return diag.FromErr(fmt.Errorf("error creating row access policy %v err = %w", name, err))
 	}
 
-	rowAccessPolicyID := &rowAccessPolicyID{
-		DatabaseName:        database,
-		SchemaName:          schema,
-		RowAccessPolicyName: name,
-	}
-	dataIDInput, err := rowAccessPolicyID.String()
-	if err != nil {
-		return err
-	}
-	d.SetId(dataIDInput)
+	d.SetId(helpers.EncodeResourceIdentifier(id))
 
-	return ReadRowAccessPolicy(d, meta)
+	return ReadRowAccessPolicy(ctx, d, meta)
 }
 
-// ReadRowAccessPolicy implements schema.ReadFunc
-func ReadRowAccessPolicy(d *schema.ResourceData, meta interface{}) error {
-	db := meta.(*sql.DB)
-	rowAccessPolicyID, err := rowAccessPolicyIDFromString(d.Id())
+func ReadRowAccessPolicy(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	client := meta.(*provider.Context).Client
+	id, err := sdk.ParseSchemaObjectIdentifier(d.Id())
 	if err != nil {
-		return err
+		return diag.FromErr(err)
 	}
 
-	dbName := rowAccessPolicyID.DatabaseName
-	schema := rowAccessPolicyID.SchemaName
-	policyName := rowAccessPolicyID.RowAccessPolicyName
-
-	builder := snowflake.RowAccessPolicy(policyName, dbName, schema)
-
-	showSQL := builder.Show()
-
-	row := snowflake.QueryRow(db, showSQL)
-
-	s, err := snowflake.ScanRowAccessPolicies(row)
+	rowAccessPolicy, err := client.RowAccessPolicies.ShowByID(ctx, id)
 	if err != nil {
-		return err
-	}
-
-	err = d.Set("name", s.Name.String)
-	if err != nil {
-		return err
-	}
-
-	err = d.Set("database", s.DatabaseName.String)
-	if err != nil {
-		return err
-	}
-
-	err = d.Set("schema", s.SchemaName.String)
-	if err != nil {
-		return err
-	}
-
-	err = d.Set("comment", s.Comment.String)
-	if err != nil {
-		return err
-	}
-
-	descSQL := builder.Describe()
-	rows, err := snowflake.Query(db, descSQL)
-	if err != nil {
-		return err
-	}
-
-	var (
-		name       string
-		signature  string
-		returnType string
-		body       string
-	)
-	for rows.Next() {
-		err := rows.Scan(&name, &signature, &returnType, &body)
-		if err != nil {
-			return err
+		if errors.Is(err, sdk.ErrObjectNotFound) {
+			d.SetId("")
+			return diag.Diagnostics{
+				diag.Diagnostic{
+					Severity: diag.Warning,
+					Summary:  "Failed to query row access policy. Marking the resource as removed.",
+					Detail:   fmt.Sprintf("row access policy name: %s, Err: %s", id.FullyQualifiedName(), err),
+				},
+			}
 		}
-
-		err = d.Set("row_access_expression", body)
-		if err != nil {
-			return err
-		}
-
-		err = d.Set("signature", ParseSignature(signature))
-		if err != nil {
-			return err
-		}
+		return diag.FromErr(err)
+	}
+	if err := d.Set(FullyQualifiedNameAttributeName, id.FullyQualifiedName()); err != nil {
+		return diag.FromErr(err)
 	}
 
-	return err
+	if err := d.Set("comment", rowAccessPolicy.Comment); err != nil {
+		return diag.FromErr(err)
+	}
+
+	rowAccessPolicyDescription, err := client.RowAccessPolicies.Describe(ctx, id)
+	if err != nil {
+		return diag.FromErr(err)
+	}
+
+	if err := d.Set("body", rowAccessPolicyDescription.Body); err != nil {
+		return diag.FromErr(err)
+	}
+	if err := d.Set("argument", schemas.RowAccessPolicyArgumentsToSchema(rowAccessPolicyDescription.Signature)); err != nil {
+		return diag.FromErr(err)
+	}
+	if err = d.Set(ShowOutputAttributeName, []map[string]any{schemas.RowAccessPolicyToSchema(rowAccessPolicy)}); err != nil {
+		return diag.FromErr(err)
+	}
+	if err = d.Set(DescribeOutputAttributeName, []map[string]any{schemas.RowAccessPolicyDescriptionToSchema(*rowAccessPolicyDescription)}); err != nil {
+		return diag.FromErr(err)
+	}
+	return nil
 }
 
-// UpdateRowAccessPolicy implements schema.UpdateFunc
-func UpdateRowAccessPolicy(d *schema.ResourceData, meta interface{}) error {
-	db := meta.(*sql.DB)
-
-	rowAccessPolicyID, err := rowAccessPolicyIDFromString(d.Id())
+// UpdateRowAccessPolicy implements schema.UpdateFunc.
+func UpdateRowAccessPolicy(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	client := meta.(*provider.Context).Client
+	id, err := sdk.ParseSchemaObjectIdentifier(d.Id())
 	if err != nil {
-		return err
+		return diag.FromErr(err)
 	}
 
-	dbName := rowAccessPolicyID.DatabaseName
-	schema := rowAccessPolicyID.SchemaName
-	policyName := rowAccessPolicyID.RowAccessPolicyName
+	if d.HasChange("name") {
+		newId := sdk.NewSchemaObjectIdentifierInSchema(id.SchemaId(), d.Get("name").(string))
 
-	builder := snowflake.RowAccessPolicy(policyName, dbName, schema)
+		err := client.RowAccessPolicies.Alter(ctx, sdk.NewAlterRowAccessPolicyRequest(id).WithRenameTo(&newId))
+		if err != nil {
+			return diag.FromErr(fmt.Errorf("error renaming view %v err = %w", d.Id(), err))
+		}
+
+		d.SetId(helpers.EncodeResourceIdentifier(newId))
+		id = newId
+	}
 
 	if d.HasChange("comment") {
 		comment := d.Get("comment")
 		if c := comment.(string); c == "" {
-			q := builder.RemoveComment()
-			err := snowflake.Exec(db, q)
+			err := client.RowAccessPolicies.Alter(ctx, sdk.NewAlterRowAccessPolicyRequest(id).WithUnsetComment(sdk.Bool(true)))
 			if err != nil {
-				return errors.Wrapf(err, "error unsetting comment for row access policy on %v", d.Id())
+				return diag.FromErr(fmt.Errorf("error unsetting comment for row access policy on %v err = %w", d.Id(), err))
 			}
 		} else {
-			q := builder.ChangeComment(c)
-			err := snowflake.Exec(db, q)
+			err := client.RowAccessPolicies.Alter(ctx, sdk.NewAlterRowAccessPolicyRequest(id).WithSetComment(sdk.String(c)))
 			if err != nil {
-				return errors.Wrapf(err, "error updating comment for row access policy on %v", d.Id())
+				return diag.FromErr(fmt.Errorf("error updating comment for row access policy on %v err = %w", d.Id(), err))
 			}
 		}
 	}
 
-	if d.HasChange("row_access_expression") {
-		rowAccessExpression := d.Get("row_access_expression")
-		q := builder.ChangeRowAccessExpression(rowAccessExpression.(string))
-		err := snowflake.Exec(db, q)
+	if d.HasChange("body") {
+		rowAccessExpression := d.Get("body").(string)
+		err := client.RowAccessPolicies.Alter(ctx, sdk.NewAlterRowAccessPolicyRequest(id).WithSetBody(sdk.String(rowAccessExpression)))
 		if err != nil {
-			return errors.Wrapf(err, "error updating row access policy expression on %v", d.Id())
+			return diag.FromErr(fmt.Errorf("error updating row access policy expression on %v err = %w", d.Id(), err))
 		}
 	}
 
-	return ReadRowAccessPolicy(d, meta)
+	return ReadRowAccessPolicy(ctx, d, meta)
 }
 
-// DeleteRowAccessPolicy implements schema.DeleteFunc
-func DeleteRowAccessPolicy(d *schema.ResourceData, meta interface{}) error {
-	db := meta.(*sql.DB)
-	rowAccessPolicyID, err := rowAccessPolicyIDFromString(d.Id())
+func DeleteRowAccessPolicy(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	id, err := sdk.ParseSchemaObjectIdentifier(d.Id())
 	if err != nil {
-		return err
+		return diag.FromErr(err)
 	}
 
-	dbName := rowAccessPolicyID.DatabaseName
-	schema := rowAccessPolicyID.SchemaName
-	policyName := rowAccessPolicyID.RowAccessPolicyName
+	client := meta.(*provider.Context).Client
 
-	q := snowflake.RowAccessPolicy(policyName, dbName, schema).Drop()
-
-	err = snowflake.Exec(db, q)
+	// TODO(SNOW-1818849): unassign policies before dropping
+	err = client.RowAccessPolicies.Drop(ctx, sdk.NewDropRowAccessPolicyRequest(id).WithIfExists(sdk.Pointer(true)))
 	if err != nil {
-		return errors.Wrapf(err, "error deleting row access policy %v", d.Id())
+		return diag.Diagnostics{
+			diag.Diagnostic{
+				Severity: diag.Error,
+				Summary:  "Error deleting row access policy",
+				Detail:   fmt.Sprintf("id %v err = %v", id.Name(), err),
+			},
+		}
 	}
 
 	d.SetId("")
 
 	return nil
-}
-
-func ParseSignature(signature string) map[string]interface{} {
-	// Format in database is `(column <data_type>)`
-	plainSignature := strings.ReplaceAll(signature, "(", "")
-	plainSignature = strings.ReplaceAll(plainSignature, ")", "")
-	signatureParts := strings.Split(plainSignature, ", ")
-	signatureMap := map[string]interface{}{}
-
-	for _, e := range signatureParts {
-		parts := strings.Split(e, " ")
-		signatureMap[parts[0]] = parts[1]
-	}
-
-	return signatureMap
 }

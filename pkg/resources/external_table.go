@@ -1,19 +1,19 @@
 package resources
 
 import (
-	"bytes"
-	"database/sql"
-	"encoding/csv"
+	"context"
 	"fmt"
-	"strings"
+	"log"
 
-	"github.com/chanzuckerberg/terraform-provider-snowflake/pkg/snowflake"
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/helpers"
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/internal/provider"
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/provider/previewfeatures"
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/provider/resources"
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/schemas"
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/sdk"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
-	"github.com/pkg/errors"
-)
-
-const (
-	externalTableIDDelimiter = '|'
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/validation"
 )
 
 var externalTableSchema = map[string]*schema.Schema{
@@ -35,6 +35,13 @@ var externalTableSchema = map[string]*schema.Schema{
 		ForceNew:    true,
 		Description: "The database in which to create the external table.",
 	},
+	"table_format": {
+		Type:         schema.TypeString,
+		Optional:     true,
+		ForceNew:     true,
+		Description:  `Identifies the external table table type. For now, only "delta" for Delta Lake table format is supported.`,
+		ValidateFunc: validation.StringInSlice([]string{"delta"}, true),
+	},
 	"column": {
 		Type:        schema.TypeList,
 		Required:    true,
@@ -50,10 +57,11 @@ var externalTableSchema = map[string]*schema.Schema{
 					ForceNew:    true,
 				},
 				"type": {
-					Type:        schema.TypeString,
-					Required:    true,
-					Description: "Column type, e.g. VARIANT",
-					ForceNew:    true,
+					Type:             schema.TypeString,
+					Required:         true,
+					Description:      "Column type, e.g. VARIANT",
+					ForceNew:         true,
+					ValidateDiagFunc: IsDataTypeValid,
 				},
 				"as": {
 					Type:        schema.TypeString,
@@ -68,7 +76,7 @@ var externalTableSchema = map[string]*schema.Schema{
 		Type:        schema.TypeString,
 		Required:    true,
 		ForceNew:    true,
-		Description: "Specifies a location for the external table.",
+		Description: "Specifies a location for the external table, using its FQDN. You can hardcode it (`\"@MYDB.MYSCHEMA.MYSTAGE\"`), or populate dynamically (`\"@${snowflake_stage.mystage.fully_qualified_name}\"`)",
 	},
 	"file_format": {
 		Type:        schema.TypeString,
@@ -125,254 +133,186 @@ var externalTableSchema = map[string]*schema.Schema{
 	"owner": {
 		Type:        schema.TypeString,
 		Computed:    true,
-		ForceNew:    true,
 		Description: "Name of the role that owns the external table.",
 	},
-	"tag": tagReferenceSchema,
+	"tag":                           tagReferenceSchema,
+	FullyQualifiedNameAttributeName: schemas.FullyQualifiedNameSchema,
 }
 
 func ExternalTable() *schema.Resource {
 	return &schema.Resource{
-		Create: CreateExternalTable,
-		Read:   ReadExternalTable,
-		Update: UpdateExternalTable,
-		Delete: DeleteExternalTable,
+		CreateContext: PreviewFeatureCreateContextWrapper(string(previewfeatures.ExternalTableResource), TrackingCreateWrapper(resources.ExternalTable, CreateExternalTable)),
+		ReadContext:   PreviewFeatureReadContextWrapper(string(previewfeatures.ExternalTableResource), TrackingReadWrapper(resources.ExternalTable, ReadExternalTable)),
+		UpdateContext: PreviewFeatureUpdateContextWrapper(string(previewfeatures.ExternalTableResource), TrackingUpdateWrapper(resources.ExternalTable, UpdateExternalTable)),
+		DeleteContext: PreviewFeatureDeleteContextWrapper(string(previewfeatures.ExternalTableResource), TrackingDeleteWrapper(resources.ExternalTable, DeleteExternalTable)),
 
 		Schema: externalTableSchema,
 		Importer: &schema.ResourceImporter{
-			State: schema.ImportStatePassthrough,
+			StateContext: schema.ImportStatePassthroughContext,
 		},
 	}
 }
 
-type externalTableID struct {
-	DatabaseName      string
-	SchemaName        string
-	ExternalTableName string
-}
+// CreateExternalTable implements schema.CreateFunc.
+func CreateExternalTable(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	client := meta.(*provider.Context).Client
 
-//String() takes in a externalTableID object and returns a pipe-delimited string:
-//DatabaseName|SchemaName|ExternalTableName
-func (si *externalTableID) String() (string, error) {
-	var buf bytes.Buffer
-	csvWriter := csv.NewWriter(&buf)
-	csvWriter.Comma = externalTableIDDelimiter
-	dataIdentifiers := [][]string{{si.DatabaseName, si.SchemaName, si.ExternalTableName}}
-	err := csvWriter.WriteAll(dataIdentifiers)
-	if err != nil {
-		return "", err
-	}
-	strExternalTableID := strings.TrimSpace(buf.String())
-	return strExternalTableID, nil
-}
+	database := d.Get("database").(string)
+	schema := d.Get("schema").(string)
+	name := d.Get("name").(string)
+	id := sdk.NewSchemaObjectIdentifier(database, schema, name)
+	location := d.Get("location").(string)
+	fileFormat := d.Get("file_format").(string)
 
-// externalTableIDFromString() takes in a pipe-delimited string: DatabaseName|SchemaName|ExternalTableName
-// and returns a externalTableID object
-func externalTableIDFromString(stringID string) (*externalTableID, error) {
-	reader := csv.NewReader(strings.NewReader(stringID))
-	reader.Comma = externalTableIDDelimiter
-	lines, err := reader.ReadAll()
-	if err != nil {
-		return nil, fmt.Errorf("Not CSV compatible")
-	}
-
-	if len(lines) != 1 {
-		return nil, fmt.Errorf("1 line at a time")
-	}
-	if len(lines[0]) != 3 {
-		return nil, fmt.Errorf("3 fields allowed")
-	}
-
-	externalTableResult := &externalTableID{
-		DatabaseName:      lines[0][0],
-		SchemaName:        lines[0][1],
-		ExternalTableName: lines[0][2],
-	}
-	return externalTableResult, nil
-}
-
-// CreateExternalTable implements schema.CreateFunc
-func CreateExternalTable(data *schema.ResourceData, meta interface{}) error {
-	db := meta.(*sql.DB)
-	database := data.Get("database").(string)
-	dbSchema := data.Get("schema").(string)
-	name := data.Get("name").(string)
-
-	// This type conversion is due to the test framework in the terraform-plugin-sdk having limited support
-	// for data types in the HCL2ValueFromConfigValue method.
-	columns := []map[string]string{}
-	for _, column := range data.Get("column").([]interface{}) {
+	tableColumns := d.Get("column").([]any)
+	columnRequests := make([]*sdk.ExternalTableColumnRequest, len(tableColumns))
+	for i, col := range tableColumns {
 		columnDef := map[string]string{}
-		for key, val := range column.(map[string]interface{}) {
+		for key, val := range col.(map[string]any) {
 			columnDef[key] = val.(string)
 		}
-		columns = append(columns, columnDef)
+		columnRequests[i] = sdk.NewExternalTableColumnRequest(
+			columnDef["name"],
+			sdk.DataType(columnDef["type"]),
+			columnDef["as"],
+		)
 	}
-	builder := snowflake.ExternalTable(name, database, dbSchema)
-	builder.WithColumns(columns)
-	builder.WithFileFormat(data.Get("file_format").(string))
-	builder.WithLocation(data.Get("location").(string))
+	autoRefresh := d.Get("auto_refresh").(bool)
+	refreshOnCreate := d.Get("refresh_on_create").(bool)
+	copyGrants := d.Get("copy_grants").(bool)
 
-	builder.WithAutoRefresh(data.Get("auto_refresh").(bool))
-	builder.WithRefreshOnCreate(data.Get("refresh_on_create").(bool))
-	builder.WithCopyGrants(data.Get("copy_grants").(bool))
-
-	// Set optionals
-	if v, ok := data.GetOk("partition_by"); ok {
-		partitionBys := expandStringList(v.([]interface{}))
-		builder.WithPartitionBys(partitionBys)
+	var partitionBy []string
+	if v, ok := d.GetOk("partition_by"); ok {
+		partitionBy = expandStringList(v.([]any))
 	}
 
-	if v, ok := data.GetOk("pattern"); ok {
-		builder.WithPattern(v.(string))
+	pattern, hasPattern := d.GetOk("pattern")
+	awsSnsTopic, hasAwsSnsTopic := d.GetOk("aws_sns_topic")
+	comment, hasComment := d.GetOk("comment")
+
+	var tagAssociationRequests []*sdk.TagAssociationRequest
+	if _, ok := d.GetOk("tag"); ok {
+		tagAssociations := getPropertyTags(d, "tag")
+		tagAssociationRequests = make([]*sdk.TagAssociationRequest, len(tagAssociations))
+		for i, t := range tagAssociations {
+			tagAssociationRequests[i] = sdk.NewTagAssociationRequest(t.Name, t.Value)
+		}
 	}
 
-	if v, ok := data.GetOk("aws_sns_topic"); ok {
-		builder.WithAwsSNSTopic(v.(string))
+	switch {
+	case d.Get("table_format").(string) == "delta":
+		req := sdk.NewCreateDeltaLakeExternalTableRequest(id, location).
+			WithColumns(columnRequests).
+			WithPartitionBy(partitionBy).
+			WithRefreshOnCreate(refreshOnCreate).
+			WithAutoRefresh(autoRefresh).
+			WithRawFileFormat(fileFormat).
+			WithCopyGrants(copyGrants).
+			WithTag(tagAssociationRequests)
+		if hasComment {
+			req = req.WithComment(comment.(string))
+		}
+		err := client.ExternalTables.CreateDeltaLake(ctx, req)
+		if err != nil {
+			return diag.FromErr(err)
+		}
+	default:
+		req := sdk.NewCreateExternalTableRequest(id, location).
+			WithColumns(columnRequests).
+			WithPartitionBy(partitionBy).
+			WithRefreshOnCreate(refreshOnCreate).
+			WithAutoRefresh(autoRefresh).
+			WithRawFileFormat(fileFormat).
+			WithCopyGrants(copyGrants).
+			WithTag(tagAssociationRequests)
+		if hasPattern {
+			req = req.WithPattern(pattern.(string))
+		}
+		if hasAwsSnsTopic {
+			req = req.WithAwsSnsTopic(awsSnsTopic.(string))
+		}
+		if hasComment {
+			req = req.WithComment(comment.(string))
+		}
+		err := client.ExternalTables.Create(ctx, req)
+		if err != nil {
+			return diag.FromErr(err)
+		}
 	}
 
-	if v, ok := data.GetOk("comment"); ok {
-		builder.WithComment(v.(string))
-	}
+	d.SetId(helpers.EncodeSnowflakeID(id))
 
-	if v, ok := data.GetOk("tag"); ok {
-		tags := getTags(v)
-		builder.WithTags(tags.toSnowflakeTagValues())
-	}
-
-	stmt := builder.Create()
-	err := snowflake.Exec(db, stmt)
-	if err != nil {
-		return errors.Wrapf(err, "error creating externalTable %v", name)
-	}
-
-	externalTableID := &externalTableID{
-		DatabaseName:      database,
-		SchemaName:        dbSchema,
-		ExternalTableName: name,
-	}
-	dataIDInput, err := externalTableID.String()
-	if err != nil {
-		return err
-	}
-	data.SetId(dataIDInput)
-
-	return ReadExternalTable(data, meta)
+	return ReadExternalTable(ctx, d, meta)
 }
 
-// ReadExternalTable implements schema.ReadFunc
-func ReadExternalTable(data *schema.ResourceData, meta interface{}) error {
-	db := meta.(*sql.DB)
-	externalTableID, err := externalTableIDFromString(data.Id())
+// ReadExternalTable implements schema.ReadFunc.
+func ReadExternalTable(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	client := meta.(*provider.Context).Client
+	id := helpers.DecodeSnowflakeID(d.Id()).(sdk.SchemaObjectIdentifier)
+
+	externalTable, err := client.ExternalTables.ShowByID(ctx, id)
 	if err != nil {
-		return err
+		log.Printf("[DEBUG] external table (%s) not found", d.Id())
+		d.SetId("")
+		return diag.FromErr(err)
 	}
 
-	dbName := externalTableID.DatabaseName
-	schema := externalTableID.SchemaName
-	name := externalTableID.ExternalTableName
-
-	stmt := snowflake.ExternalTable(name, dbName, schema).Show()
-	row := snowflake.QueryRow(db, stmt)
-	externalTable, err := snowflake.ScanExternalTable(row)
-	if err != nil {
-		return err
+	if err := d.Set(FullyQualifiedNameAttributeName, id.FullyQualifiedName()); err != nil {
+		return diag.FromErr(err)
 	}
 
-	err = data.Set("name", externalTable.ExternalTableName.String)
-	if err != nil {
-		return err
+	if err := d.Set("name", externalTable.Name); err != nil {
+		return diag.FromErr(err)
 	}
 
-	err = data.Set("owner", externalTable.Owner.String)
-	if err != nil {
-		return err
+	if err := d.Set("owner", externalTable.Owner); err != nil {
+		return diag.FromErr(err)
 	}
 
 	return nil
 }
 
-// UpdateExternalTable implements schema.UpdateFunc
-func UpdateExternalTable(data *schema.ResourceData, meta interface{}) error {
-	db := meta.(*sql.DB)
-	database := data.Get("database").(string)
-	dbSchema := data.Get("schema").(string)
-	name := data.Get("name").(string)
+// UpdateExternalTable implements schema.UpdateFunc.
+func UpdateExternalTable(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	client := meta.(*provider.Context).Client
+	id := helpers.DecodeSnowflakeID(d.Id()).(sdk.SchemaObjectIdentifier)
 
-	builder := snowflake.ExternalTable(name, database, dbSchema)
+	if d.HasChange("tag") {
+		unsetTags, setTags := GetTagsDiff(d, "tag")
 
-	if data.HasChange("tag") {
-		v := data.Get("tag")
-		tags := getTags(v)
-		builder.WithTags(tags.toSnowflakeTagValues())
+		if len(unsetTags) > 0 {
+			err := client.ExternalTables.Alter(ctx, sdk.NewAlterExternalTableRequest(id).WithUnsetTag(unsetTags))
+			if err != nil {
+				return diag.FromErr(fmt.Errorf("error setting tags on %v, err = %w", d.Id(), err))
+			}
+		}
+
+		if len(setTags) > 0 {
+			tagAssociationRequests := make([]*sdk.TagAssociationRequest, len(setTags))
+			for i, t := range setTags {
+				tagAssociationRequests[i] = sdk.NewTagAssociationRequest(t.Name, t.Value)
+			}
+			err := client.ExternalTables.Alter(ctx, sdk.NewAlterExternalTableRequest(id).WithSetTag(tagAssociationRequests))
+			if err != nil {
+				return diag.FromErr(fmt.Errorf("error setting tags on %v, err = %w", d.Id(), err))
+			}
+		}
 	}
 
-	stmt := builder.Update()
-	err := snowflake.Exec(db, stmt)
-	if err != nil {
-		return errors.Wrapf(err, "error updating externalTable %v", name)
-	}
-
-	externalTableID := &externalTableID{
-		DatabaseName:      database,
-		SchemaName:        dbSchema,
-		ExternalTableName: name,
-	}
-	dataIDInput, err := externalTableID.String()
-	if err != nil {
-		return err
-	}
-	data.SetId(dataIDInput)
-
-	return ReadExternalTable(data, meta)
+	return ReadExternalTable(ctx, d, meta)
 }
 
-// DeleteExternalTable implements schema.DeleteFunc
-func DeleteExternalTable(data *schema.ResourceData, meta interface{}) error {
-	db := meta.(*sql.DB)
-	externalTableID, err := externalTableIDFromString(data.Id())
+// DeleteExternalTable implements schema.DeleteFunc.
+func DeleteExternalTable(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	client := meta.(*provider.Context).Client
+	id := helpers.DecodeSnowflakeID(d.Id()).(sdk.SchemaObjectIdentifier)
+
+	err := client.ExternalTables.Drop(ctx, sdk.NewDropExternalTableRequest(id))
 	if err != nil {
-		return err
+		return diag.FromErr(err)
 	}
 
-	dbName := externalTableID.DatabaseName
-	schema := externalTableID.SchemaName
-	externalTableName := externalTableID.ExternalTableName
-
-	q := snowflake.ExternalTable(externalTableName, dbName, schema).Drop()
-
-	err = snowflake.Exec(db, q)
-	if err != nil {
-		return errors.Wrapf(err, "error deleting pipe %v", data.Id())
-	}
-
-	data.SetId("")
+	d.SetId("")
 
 	return nil
-}
-
-// ExternalTableExists implements schema.ExistsFunc
-func ExternalTableExists(data *schema.ResourceData, meta interface{}) (bool, error) {
-	db := meta.(*sql.DB)
-	externalTableID, err := externalTableIDFromString(data.Id())
-	if err != nil {
-		return false, err
-	}
-
-	dbName := externalTableID.DatabaseName
-	schema := externalTableID.SchemaName
-	externalTableName := externalTableID.ExternalTableName
-
-	q := snowflake.ExternalTable(externalTableName, dbName, schema).Show()
-	rows, err := db.Query(q)
-	if err != nil {
-		return false, err
-	}
-	defer rows.Close()
-
-	if rows.Next() {
-		return true, nil
-	}
-
-	return false, nil
 }

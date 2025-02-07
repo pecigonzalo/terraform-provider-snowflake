@@ -1,11 +1,16 @@
 package datasources
 
 import (
-	"database/sql"
+	"context"
 	"fmt"
-	"log"
 
-	"github.com/chanzuckerberg/terraform-provider-snowflake/pkg/snowflake"
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/provider/datasources"
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/provider/previewfeatures"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
+
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/internal/provider"
+
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/sdk"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 )
 
@@ -50,41 +55,34 @@ var sequencesSchema = map[string]*schema.Schema{
 
 func Sequences() *schema.Resource {
 	return &schema.Resource{
-		Read:   ReadSequences,
-		Schema: sequencesSchema,
+		ReadContext: PreviewFeatureReadWrapper(string(previewfeatures.SequencesDatasource), TrackingReadWrapper(datasources.Sequences, ReadSequences)),
+		Schema:      sequencesSchema,
 	}
 }
 
-func ReadSequences(d *schema.ResourceData, meta interface{}) error {
-	db := meta.(*sql.DB)
+func ReadSequences(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	client := meta.(*provider.Context).Client
 	databaseName := d.Get("database").(string)
 	schemaName := d.Get("schema").(string)
 
-	currentSequences, err := snowflake.ListSequences(databaseName, schemaName, db)
-	if err == sql.ErrNoRows {
-		// If not found, mark resource to be removed from statefile during apply or refresh
-		log.Printf("[DEBUG] sequences in schema (%s) not found", d.Id())
-		d.SetId("")
-		return nil
-	} else if err != nil {
-		log.Printf("[DEBUG] unable to parse sequences in schema (%s)", d.Id())
-		d.SetId("")
-		return nil
+	req := sdk.NewShowSequenceRequest().WithIn(sdk.In{
+		Schema: sdk.NewDatabaseObjectIdentifier(databaseName, schemaName),
+	})
+	seqs, err := client.Sequences.Show(ctx, req)
+	if err != nil {
+		return diag.FromErr(err)
 	}
-
 	sequences := []map[string]interface{}{}
-
-	for _, sequence := range currentSequences {
+	for _, seq := range seqs {
 		sequenceMap := map[string]interface{}{}
-
-		sequenceMap["name"] = sequence.Name.String
-		sequenceMap["database"] = sequence.DBName.String
-		sequenceMap["schema"] = sequence.SchemaName.String
-		sequenceMap["comment"] = sequence.Comment.String
+		sequenceMap["name"] = seq.Name
+		sequenceMap["database"] = seq.DatabaseName
+		sequenceMap["schema"] = seq.SchemaName
+		sequenceMap["comment"] = seq.Comment
 
 		sequences = append(sequences, sequenceMap)
 	}
 
 	d.SetId(fmt.Sprintf(`%v|%v`, databaseName, schemaName))
-	return d.Set("sequences", sequences)
+	return diag.FromErr(d.Set("sequences", sequences))
 }

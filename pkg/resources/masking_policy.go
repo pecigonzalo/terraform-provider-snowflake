@@ -1,312 +1,382 @@
 package resources
 
 import (
-	"bytes"
-	"database/sql"
-	"encoding/csv"
+	"context"
+	"errors"
 	"fmt"
-	"strings"
+	"log"
 
-	"github.com/chanzuckerberg/terraform-provider-snowflake/pkg/snowflake"
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/helpers"
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/internal/provider"
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/provider/resources"
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/schemas"
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/sdk"
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/sdk/datatypes"
+	"github.com/hashicorp/go-cty/cty"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/customdiff"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
-	"github.com/pkg/errors"
-)
-
-const (
-	maskingPolicyIDDelimiter = '|'
 )
 
 var maskingPolicySchema = map[string]*schema.Schema{
 	"name": {
-		Type:        schema.TypeString,
-		Required:    true,
-		Description: "Specifies the identifier for the masking policy; must be unique for the database and schema in which the masking policy is created.",
-		ForceNew:    true,
+		Type:             schema.TypeString,
+		Required:         true,
+		Description:      blocklistedCharactersFieldDescription("Specifies the identifier for the masking policy; must be unique for the database and schema in which the masking policy is created."),
+		DiffSuppressFunc: suppressIdentifierQuoting,
 	},
 	"database": {
-		Type:        schema.TypeString,
-		Required:    true,
-		Description: "The database in which to create the masking policy.",
-		ForceNew:    true,
+		Type:             schema.TypeString,
+		Required:         true,
+		Description:      blocklistedCharactersFieldDescription("The database in which to create the masking policy."),
+		ForceNew:         true,
+		DiffSuppressFunc: suppressIdentifierQuoting,
 	},
 	"schema": {
-		Type:        schema.TypeString,
+		Type:             schema.TypeString,
+		Required:         true,
+		Description:      blocklistedCharactersFieldDescription("The schema in which to create the masking policy."),
+		ForceNew:         true,
+		DiffSuppressFunc: suppressIdentifierQuoting,
+	},
+	"argument": {
+		Type:     schema.TypeList,
+		MinItems: 1,
+		Elem: &schema.Resource{
+			Schema: map[string]*schema.Schema{
+				"name": {
+					Type:        schema.TypeString,
+					Required:    true,
+					Description: "The argument name",
+					ForceNew:    true,
+				},
+				// TODO(SNOW-1596962): Fully support VECTOR data type sdk.ParseFunctionArgumentsFromString could be a base for another function that takes argument names into consideration.
+				"type": {
+					Type:             schema.TypeString,
+					Required:         true,
+					DiffSuppressFunc: DiffSuppressDataTypes,
+					ValidateDiagFunc: IsDataTypeValid,
+					Description:      dataTypeFieldDescription("The argument type. VECTOR data types are not yet supported."),
+					ForceNew:         true,
+				},
+			},
+		},
 		Required:    true,
-		Description: "The schema in which to create the masking policy.",
+		Description: "List of the arguments for the masking policy. The first column and its data type always indicate the column data type values to mask or tokenize in the subsequent policy conditions. Note that you can not specify a virtual column as the first column argument in a conditional masking policy.",
 		ForceNew:    true,
 	},
-	"value_data_type": {
-		Type:        schema.TypeString,
-		Required:    true,
-		Description: "Specifies the data type to mask.",
-		ForceNew:    true,
-	},
-	"masking_expression": {
-		Type:        schema.TypeString,
-		Required:    true,
-		Description: "Specifies the SQL expression that transforms the data.",
+	"body": {
+		Type:             schema.TypeString,
+		Required:         true,
+		Description:      diffSuppressStatementFieldDescription("Specifies the SQL expression that transforms the data."),
+		DiffSuppressFunc: DiffSuppressStatement,
 	},
 	"return_data_type": {
-		Type:        schema.TypeString,
-		Required:    true,
-		Description: "Specifies the data type to return.",
-		ForceNew:    true,
+		Type:             schema.TypeString,
+		Required:         true,
+		Description:      dataTypeFieldDescription("The return data type must match the input data type of the first column that is specified as an input column."),
+		ForceNew:         true,
+		DiffSuppressFunc: DiffSuppressDataTypes,
+		ValidateDiagFunc: IsDataTypeValid,
+	},
+	"exempt_other_policies": {
+		Type:             schema.TypeString,
+		Optional:         true,
+		Default:          BooleanDefault,
+		ValidateDiagFunc: validateBooleanString,
+		DiffSuppressFunc: IgnoreChangeToCurrentSnowflakeValueInShow("exempt_other_policies"),
+		Description:      booleanStringFieldDescription("Specifies whether the row access policy or conditional masking policy can reference a column that is already protected by a masking policy. Due to Snowflake limitations, when value is chenged, the resource is recreated."),
+		ForceNew:         true,
 	},
 	"comment": {
 		Type:        schema.TypeString,
 		Optional:    true,
 		Description: "Specifies a comment for the masking policy.",
 	},
+	ShowOutputAttributeName: {
+		Type:        schema.TypeList,
+		Computed:    true,
+		Description: "Outputs the result of `SHOW MASKING POLICIES` for the given masking policy.",
+		Elem: &schema.Resource{
+			Schema: schemas.ShowMaskingPolicySchema,
+		},
+	},
+	DescribeOutputAttributeName: {
+		Type:        schema.TypeList,
+		Computed:    true,
+		Description: "Outputs the result of `DESCRIBE MASKING POLICY` for the given masking policy.",
+		Elem: &schema.Resource{
+			Schema: schemas.DescribeMaskingPolicySchema,
+		},
+	},
+	FullyQualifiedNameAttributeName: schemas.FullyQualifiedNameSchema,
 }
 
-type maskingPolicyID struct {
-	DatabaseName      string
-	SchemaName        string
-	MaskingPolicyName string
-}
-
-// String() takes in a maskingPolicyID object and returns a pipe-delimited string:
-// DatabaseName|SchemaName|MaskingPolicyName
-func (mpi *maskingPolicyID) String() (string, error) {
-	var buf bytes.Buffer
-	csvWriter := csv.NewWriter(&buf)
-	csvWriter.Comma = maskingPolicyIDDelimiter
-	dataIdentifiers := [][]string{{mpi.DatabaseName, mpi.SchemaName, mpi.MaskingPolicyName}}
-	err := csvWriter.WriteAll(dataIdentifiers)
-	if err != nil {
-		return "", err
-	}
-	strMaskingPolicyID := strings.TrimSpace(buf.String())
-	return strMaskingPolicyID, nil
-}
-
-/// maskingPolicyIDFromString() takes in a pipe-delimited string: DatabaseName|SchemaName|MaskingPolicyName
-// and returns a maskingPolicyID object
-func maskingPolicyIDFromString(stringID string) (*maskingPolicyID, error) {
-	reader := csv.NewReader(strings.NewReader(stringID))
-	reader.Comma = maskingPolicyIDDelimiter
-	lines, err := reader.ReadAll()
-	if err != nil {
-		return nil, fmt.Errorf("Not CSV compatible")
-	}
-
-	if len(lines) != 1 {
-		return nil, fmt.Errorf("1 line per masking policy")
-	}
-	if len(lines[0]) != 3 {
-		return nil, fmt.Errorf("3 fields allowed")
-	}
-
-	maskingPolicyResult := &maskingPolicyID{
-		DatabaseName:      lines[0][0],
-		SchemaName:        lines[0][1],
-		MaskingPolicyName: lines[0][2],
-	}
-	return maskingPolicyResult, nil
-}
-
-// MaskingPolicy returns a pointer to the resource representing a masking policy
+// MaskingPolicy returns a pointer to the resource representing a masking policy.
 func MaskingPolicy() *schema.Resource {
 	return &schema.Resource{
-		Create: CreateMaskingPolicy,
-		Read:   ReadMaskingPolicy,
-		Update: UpdateMaskingPolicy,
-		Delete: DeleteMaskingPolicy,
+		SchemaVersion: 1,
+
+		CreateContext: TrackingCreateWrapper(resources.MaskingPolicy, CreateMaskingPolicy),
+		ReadContext:   TrackingReadWrapper(resources.MaskingPolicy, ReadMaskingPolicy(true)),
+		UpdateContext: TrackingUpdateWrapper(resources.MaskingPolicy, UpdateMaskingPolicy),
+		DeleteContext: TrackingDeleteWrapper(resources.MaskingPolicy, DeleteMaskingPolicy),
+		Description:   "Resource used to manage masking policies. For more information, check [masking policies documentation](https://docs.snowflake.com/en/sql-reference/sql/create-masking-policy).",
+
+		CustomizeDiff: TrackingCustomDiffWrapper(resources.MaskingPolicy, customdiff.All(
+			ComputedIfAnyAttributeChanged(maskingPolicySchema, ShowOutputAttributeName, "name", "comment"),
+			ComputedIfAnyAttributeChanged(maskingPolicySchema, DescribeOutputAttributeName, "name", "body"),
+			ComputedIfAnyAttributeChanged(maskingPolicySchema, FullyQualifiedNameAttributeName, "name"),
+		)),
 
 		Schema: maskingPolicySchema,
 		Importer: &schema.ResourceImporter{
-			StateContext: schema.ImportStatePassthroughContext,
+			StateContext: TrackingImportWrapper(resources.MaskingPolicy, ImportMaskingPolicy),
+		},
+
+		StateUpgraders: []schema.StateUpgrader{
+			{
+				Version: 0,
+				// setting type to cty.EmptyObject is a bit hacky here but following https://developer.hashicorp.com/terraform/plugin/framework/migrating/resources/state-upgrade#sdkv2-1 would require lots of repetitive code; this should work with cty.EmptyObject
+				Type:    cty.EmptyObject,
+				Upgrade: v0_95_0_MaskingPolicyStateUpgrader,
+			},
 		},
 	}
 }
 
-// CreateMaskingPolicy implements schema.CreateFunc
-func CreateMaskingPolicy(d *schema.ResourceData, meta interface{}) error {
-	db := meta.(*sql.DB)
+func ImportMaskingPolicy(ctx context.Context, d *schema.ResourceData, meta any) ([]*schema.ResourceData, error) {
+	log.Printf("[DEBUG] Starting masking policy import")
+	client := meta.(*provider.Context).Client
+	id, err := sdk.ParseSchemaObjectIdentifier(d.Id())
+	if err != nil {
+		return nil, err
+	}
+
+	policy, err := client.MaskingPolicies.ShowByID(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if err := d.Set("name", id.Name()); err != nil {
+		return nil, err
+	}
+	if err := d.Set("database", id.DatabaseName()); err != nil {
+		return nil, err
+	}
+	if err := d.Set("schema", id.SchemaName()); err != nil {
+		return nil, err
+	}
+	if err := d.Set("exempt_other_policies", booleanStringFromBool(policy.ExemptOtherPolicies)); err != nil {
+		return nil, err
+	}
+	policyDescription, err := client.MaskingPolicies.Describe(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if err := d.Set("body", policyDescription.Body); err != nil {
+		return nil, err
+	}
+	if err := d.Set("argument", schemas.MaskingPolicyArgumentsToSchema(policyDescription.Signature)); err != nil {
+		return nil, err
+	}
+	return []*schema.ResourceData{d}, nil
+}
+
+func CreateMaskingPolicy(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	client := meta.(*provider.Context).Client
+
 	name := d.Get("name").(string)
-	database := d.Get("database").(string)
-	schema := d.Get("schema").(string)
-	valueDataType := d.Get("value_data_type").(string)
-	maskingExpression := d.Get("masking_expression").(string)
+	databaseName := d.Get("database").(string)
+	schemaName := d.Get("schema").(string)
+	id := sdk.NewSchemaObjectIdentifier(databaseName, schemaName, name)
+
+	expression := d.Get("body").(string)
 	returnDataType := d.Get("return_data_type").(string)
 
-	builder := snowflake.MaskingPolicy(name, database, schema)
-
-	builder.WithValueDataType(valueDataType)
-	builder.WithMaskingExpression(maskingExpression)
-	builder.WithReturnDataType(returnDataType)
-
-	// Set optionals
-	if v, ok := d.GetOk("comment"); ok {
-		builder.WithComment(v.(string))
+	arguments := d.Get("argument").([]any)
+	args := make([]sdk.TableColumnSignature, 0)
+	for _, arg := range arguments {
+		v := arg.(map[string]any)
+		dataType, err := datatypes.ParseDataType(v["type"].(string))
+		if err != nil {
+			return diag.FromErr(err)
+		}
+		args = append(args, sdk.TableColumnSignature{
+			Name: v["name"].(string),
+			Type: sdk.LegacyDataTypeFrom(dataType),
+		})
 	}
 
-	stmt := builder.Create()
-	err := snowflake.Exec(db, stmt)
+	returns, err := datatypes.ParseDataType(returnDataType)
 	if err != nil {
-		return errors.Wrapf(err, "error creating masking policy %v", name)
+		return diag.FromErr(err)
 	}
 
-	maskingPolicyID := &maskingPolicyID{
-		DatabaseName:      database,
-		SchemaName:        schema,
-		MaskingPolicyName: name,
+	// set optionals
+	opts := &sdk.CreateMaskingPolicyOptions{}
+	if comment, ok := d.Get("comment").(string); ok {
+		opts.Comment = sdk.String(comment)
 	}
-	dataIDInput, err := maskingPolicyID.String()
+	if v := d.Get("exempt_other_policies").(string); v != BooleanDefault {
+		parsed, err := booleanStringToBool(v)
+		if err != nil {
+			return diag.FromErr(err)
+		}
+		opts.ExemptOtherPolicies = sdk.Pointer(parsed)
+	}
+
+	err = client.MaskingPolicies.Create(ctx, id, args, sdk.LegacyDataTypeFrom(returns), expression, opts)
 	if err != nil {
-		return err
+		return diag.FromErr(err)
 	}
-	d.SetId(dataIDInput)
+	d.SetId(helpers.EncodeResourceIdentifier(id))
 
-	return ReadMaskingPolicy(d, meta)
+	return ReadMaskingPolicy(false)(ctx, d, meta)
 }
 
-// ReadMaskingPolicy implements schema.ReadFunc
-func ReadMaskingPolicy(d *schema.ResourceData, meta interface{}) error {
-	db := meta.(*sql.DB)
-	maskingPolicyID, err := maskingPolicyIDFromString(d.Id())
-	if err != nil {
-		return err
-	}
-
-	dbName := maskingPolicyID.DatabaseName
-	schema := maskingPolicyID.SchemaName
-	policyName := maskingPolicyID.MaskingPolicyName
-
-	builder := snowflake.MaskingPolicy(policyName, dbName, schema)
-
-	showSQL := builder.Show()
-
-	row := snowflake.QueryRow(db, showSQL)
-
-	s, err := snowflake.ScanMaskingPolicies(row)
-	if err != nil {
-		return err
-	}
-
-	err = d.Set("name", s.Name.String)
-	if err != nil {
-		return err
-	}
-
-	err = d.Set("database", s.DatabaseName.String)
-	if err != nil {
-		return err
-	}
-
-	err = d.Set("schema", s.SchemaName.String)
-	if err != nil {
-		return err
-	}
-
-	err = d.Set("comment", s.Comment.String)
-	if err != nil {
-		return err
-	}
-
-	descSQL := builder.Describe()
-	rows, err := snowflake.Query(db, descSQL)
-	if err != nil {
-		return err
-	}
-
-	var (
-		name       string
-		signature  string
-		returnType string
-		body       string
-	)
-	for rows.Next() {
-		err := rows.Scan(&name, &signature, &returnType, &body)
+func ReadMaskingPolicy(withExternalChangesMarking bool) schema.ReadContextFunc {
+	return func(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+		client := meta.(*provider.Context).Client
+		id, err := sdk.ParseSchemaObjectIdentifier(d.Id())
 		if err != nil {
-			return err
+			return diag.FromErr(err)
 		}
 
-		err = d.Set("masking_expression", body)
+		maskingPolicy, err := client.MaskingPolicies.ShowByID(ctx, id)
 		if err != nil {
-			return err
+			if errors.Is(err, sdk.ErrObjectNotFound) {
+				d.SetId("")
+				return diag.Diagnostics{
+					diag.Diagnostic{
+						Severity: diag.Warning,
+						Summary:  "Failed to query masking policy. Marking the resource as removed.",
+						Detail:   fmt.Sprintf("masking policy name: %s, Err: %s", id.FullyQualifiedName(), err),
+					},
+				}
+			}
+			return diag.FromErr(err)
+		}
+		if err := d.Set(FullyQualifiedNameAttributeName, id.FullyQualifiedName()); err != nil {
+			return diag.FromErr(err)
 		}
 
-		err = d.Set("return_data_type", returnType)
-		if err != nil {
-			return err
+		if err := d.Set("comment", maskingPolicy.Comment); err != nil {
+			return diag.FromErr(err)
 		}
 
-		// format in database is `(VAL <data_type>)`
-		valueDataType := strings.TrimSuffix(strings.Split(signature, " ")[1], ")")
-		err = d.Set("value_data_type", valueDataType)
+		maskingPolicyDescription, err := client.MaskingPolicies.Describe(ctx, id)
 		if err != nil {
-			return err
+			return diag.FromErr(err)
 		}
+
+		if err := d.Set("body", maskingPolicyDescription.Body); err != nil {
+			return diag.FromErr(err)
+		}
+
+		if err := d.Set("return_data_type", maskingPolicyDescription.ReturnType); err != nil {
+			return diag.FromErr(err)
+		}
+
+		if err := d.Set("argument", schemas.MaskingPolicyArgumentsToSchema(maskingPolicyDescription.Signature)); err != nil {
+			return diag.FromErr(err)
+		}
+
+		if withExternalChangesMarking {
+			if err = handleExternalChangesToObjectInShow(d,
+				outputMapping{"exempt_other_policies", "exempt_other_policies", maskingPolicy.ExemptOtherPolicies, booleanStringFromBool(maskingPolicy.ExemptOtherPolicies), nil},
+			); err != nil {
+				return diag.FromErr(err)
+			}
+		}
+
+		if err = setStateToValuesFromConfig(d, maskingPolicySchema, []string{
+			"exempt_other_policies",
+		}); err != nil {
+			return diag.FromErr(err)
+		}
+
+		if err = d.Set(ShowOutputAttributeName, []map[string]any{schemas.MaskingPolicyToSchema(maskingPolicy)}); err != nil {
+			return diag.FromErr(err)
+		}
+		if err = d.Set(DescribeOutputAttributeName, []map[string]any{schemas.MaskingPolicyDescriptionToSchema(*maskingPolicyDescription)}); err != nil {
+			return diag.FromErr(err)
+		}
+		return nil
 	}
-
-	return err
 }
 
-// UpdateMaskingPolicy implements schema.UpdateFunc
-func UpdateMaskingPolicy(d *schema.ResourceData, meta interface{}) error {
-	db := meta.(*sql.DB)
-
-	maskingPolicyID, err := maskingPolicyIDFromString(d.Id())
+func UpdateMaskingPolicy(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	client := meta.(*provider.Context).Client
+	id, err := sdk.ParseSchemaObjectIdentifier(d.Id())
 	if err != nil {
-		return err
+		return diag.FromErr(err)
+	}
+	if d.HasChange("name") {
+		newID := sdk.NewSchemaObjectIdentifierInSchema(id.SchemaId(), d.Get("name").(string))
+
+		err := client.MaskingPolicies.Alter(ctx, id, &sdk.AlterMaskingPolicyOptions{
+			NewName: &newID,
+		})
+		if err != nil {
+			return diag.FromErr(err)
+		}
+
+		d.SetId(helpers.EncodeResourceIdentifier(newID))
+		id = newID
 	}
 
-	dbName := maskingPolicyID.DatabaseName
-	schema := maskingPolicyID.SchemaName
-	policyName := maskingPolicyID.MaskingPolicyName
-
-	builder := snowflake.MaskingPolicy(policyName, dbName, schema)
+	if d.HasChange("body") {
+		alterOptions := &sdk.AlterMaskingPolicyOptions{
+			Set: &sdk.MaskingPolicySet{
+				Body: sdk.Pointer(d.Get("body").(string)),
+			},
+		}
+		err := client.MaskingPolicies.Alter(ctx, id, alterOptions)
+		if err != nil {
+			return diag.FromErr(err)
+		}
+	}
 
 	if d.HasChange("comment") {
-		comment := d.Get("comment")
-		if c := comment.(string); c == "" {
-			q := builder.RemoveComment()
-			err := snowflake.Exec(db, q)
-			if err != nil {
-				return errors.Wrapf(err, "error unsetting comment for masking policy on %v", d.Id())
+		alterOptions := &sdk.AlterMaskingPolicyOptions{}
+		if v, ok := d.GetOk("comment"); ok {
+			alterOptions.Set = &sdk.MaskingPolicySet{
+				Comment: sdk.String(v.(string)),
 			}
 		} else {
-			q := builder.ChangeComment(c)
-			err := snowflake.Exec(db, q)
-			if err != nil {
-				return errors.Wrapf(err, "error updating comment for masking policy on %v", d.Id())
+			alterOptions.Unset = &sdk.MaskingPolicyUnset{
+				Comment: sdk.Bool(true),
 			}
 		}
-	}
-
-	if d.HasChange("masking_expression") {
-		maskingExpression := d.Get("masking_expression")
-		q := builder.ChangeMaskingExpression(maskingExpression.(string))
-		err := snowflake.Exec(db, q)
+		err := client.MaskingPolicies.Alter(ctx, id, alterOptions)
 		if err != nil {
-			return errors.Wrapf(err, "error updating masking policy expression on %v", d.Id())
+			return diag.FromErr(err)
 		}
 	}
+	// exempt_other_policies is handled by ForceNew
 
-	return ReadMaskingPolicy(d, meta)
+	return ReadMaskingPolicy(false)(ctx, d, meta)
 }
 
-// DeleteMaskingPolicy implements schema.DeleteFunc
-func DeleteMaskingPolicy(d *schema.ResourceData, meta interface{}) error {
-	db := meta.(*sql.DB)
-	maskingPolicyID, err := maskingPolicyIDFromString(d.Id())
+func DeleteMaskingPolicy(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	client := meta.(*provider.Context).Client
+	id, err := sdk.ParseSchemaObjectIdentifier(d.Id())
 	if err != nil {
-		return err
+		return diag.FromErr(err)
 	}
 
-	dbName := maskingPolicyID.DatabaseName
-	schema := maskingPolicyID.SchemaName
-	policyName := maskingPolicyID.MaskingPolicyName
-
-	q := snowflake.MaskingPolicy(policyName, dbName, schema).Drop()
-
-	err = snowflake.Exec(db, q)
+	// TODO(SNOW-1818849): unassign policies before dropping
+	err = client.MaskingPolicies.Drop(ctx, id, &sdk.DropMaskingPolicyOptions{IfExists: sdk.Pointer(true)})
 	if err != nil {
-		return errors.Wrapf(err, "error deleting masking policy %v", d.Id())
+		return diag.Diagnostics{
+			diag.Diagnostic{
+				Severity: diag.Error,
+				Summary:  "Error deleting masking policy",
+				Detail:   fmt.Sprintf("id %v err = %v", id.Name(), err),
+			},
+		}
 	}
 
 	d.SetId("")
-
 	return nil
 }

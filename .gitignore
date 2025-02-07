@@ -12,12 +12,12 @@
 coverage.txt
 *.out
 
-.vscode
 terraform-provider-snowflake*
 
 .DS_Store
 *tfstate*
 .terraform
+.terraform.lock.hcl
 crash.log
 .envrc
 bin
@@ -26,3 +26,7 @@ dist
 # JetBrains
 .idea/
 *.iml
+dist/
+
+# Test environment variables
+test.env

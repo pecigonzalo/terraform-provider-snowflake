@@ -1,11 +1,16 @@
 package datasources
 
 import (
-	"database/sql"
+	"context"
 	"fmt"
-	"log"
 
-	"github.com/chanzuckerberg/terraform-provider-snowflake/pkg/snowflake"
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/provider/datasources"
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/provider/previewfeatures"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
+
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/internal/provider"
+
+	"github.com/Snowflake-Labs/terraform-provider-snowflake/pkg/sdk"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 )
 
@@ -55,42 +60,41 @@ var fileFormatsSchema = map[string]*schema.Schema{
 
 func FileFormats() *schema.Resource {
 	return &schema.Resource{
-		Read:   ReadFileFormats,
-		Schema: fileFormatsSchema,
+		ReadContext: PreviewFeatureReadWrapper(string(previewfeatures.FileFormatsDatasource), TrackingReadWrapper(datasources.FileFormats, ReadFileFormats)),
+		Schema:      fileFormatsSchema,
 	}
 }
 
-func ReadFileFormats(d *schema.ResourceData, meta interface{}) error {
-	db := meta.(*sql.DB)
+func ReadFileFormats(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	client := meta.(*provider.Context).Client
+
 	databaseName := d.Get("database").(string)
 	schemaName := d.Get("schema").(string)
 
-	currentFileFormats, err := snowflake.ListFileFormats(databaseName, schemaName, db)
-	if err == sql.ErrNoRows {
-		// If not found, mark resource to be removed from statefile during apply or refresh
-		log.Printf("[DEBUG] file formats in schema (%s) not found", d.Id())
+	result, err := client.FileFormats.Show(ctx, &sdk.ShowFileFormatsOptions{
+		In: &sdk.In{
+			Schema: sdk.NewDatabaseObjectIdentifier(databaseName, schemaName),
+		},
+	})
+	if err != nil {
 		d.SetId("")
-		return nil
-	} else if err != nil {
-		log.Printf("[DEBUG] unable to parse file formats in schema (%s)", d.Id())
-		d.SetId("")
-		return nil
+		return diag.FromErr(err)
 	}
 
 	fileFormats := []map[string]interface{}{}
 
-	for _, fileFormat := range currentFileFormats {
+	for _, fileFormat := range result {
 		fileFormatMap := map[string]interface{}{}
 
-		fileFormatMap["name"] = fileFormat.FileFormatName.String
-		fileFormatMap["database"] = fileFormat.DatabaseName.String
-		fileFormatMap["schema"] = fileFormat.SchemaName.String
-		fileFormatMap["comment"] = fileFormat.Comment.String
-		fileFormatMap["format_type"] = fileFormat.FormatType.String
+		fileFormatMap["name"] = fileFormat.Name.Name()
+		fileFormatMap["database"] = fileFormat.Name.DatabaseName()
+		fileFormatMap["schema"] = fileFormat.Name.SchemaName()
+		fileFormatMap["comment"] = fileFormat.Comment
+		fileFormatMap["format_type"] = fileFormat.Type
 
 		fileFormats = append(fileFormats, fileFormatMap)
 	}
 
 	d.SetId(fmt.Sprintf(`%v|%v`, databaseName, schemaName))
-	return d.Set("file_formats", fileFormats)
+	return diag.FromErr(d.Set("file_formats", fileFormats))
 }
